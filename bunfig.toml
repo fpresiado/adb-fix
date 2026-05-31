@@ -1,0 +1,8 @@
+[install]
+exact = true
+production = false
+
+[test]
+preload = ["./tests/setup.ts"]
+coverage = true
+coverageThreshold = 0.85
