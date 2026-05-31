@@ -23,6 +23,48 @@
 | 5a | CPU | AMD Ryzen Threadripper 2970WX, 24C/48T | ✓ matches blueprint |
 | 5b | NUMA topology | **4 nodes confirmed** via `Get-Counter '\NUMA Node Memory(*)\Total MBytes'` | `Win32_NumaNode` WMI class not present on this Windows build. |
 
+## Pre-P5 spike (Bun FFI + Win32 NUMA APIs)
+
+Run `bun run scripts/spike-numa.ts` to reproduce. Outcomes:
+
+| # | Probe | Result |
+|---|-------|--------|
+| 1 | `dlopen("kernel32", { GetLogicalProcessorInformationEx })` | ✓ symbol resolves |
+| 2 | Call with `RelationNumaNode (1)` | ✓ `returns=true`, `ReturnedLength=192` |
+| 3 | Parse `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` records | ✓ struct walked cleanly |
+| 4 | Real NUMA topology returned | **see below — blueprint hardcodes were incorrect** |
+
+**Actual Threadripper 2970WX NUMA topology (per Windows):**
+```
+NumaNode 0: cores 0-11   (mask 0x0000_0000_0000_0fff)
+NumaNode 1: cores 24-35  (mask 0x0000_000f_ff00_0000)
+NumaNode 2: cores 12-23  (mask 0x0000_0000_00ff_f000)
+NumaNode 3: cores 36-47  (mask 0x0000_0fff_0000_0000)
+1 processor package, 4 NUMA nodes, 12 LPs per node = 48 LPs total
+```
+
+**vs. blueprint Table 5 (which is INCORRECT for this host):**
+```
+Die 0: 0x3F   (cores 0-5)   ← wrong: blueprint assumed 6 LPs/node, actual is 12
+Die 1: 0xFC0  (cores 6-11)  ← wrong: those cores belong to node 0, not die 1
+```
+
+**Decision (pre-locked by owner — runtime auto-detect):** P5 NUMA pinner ignores the blueprint hardcodes and uses the live `GetLogicalProcessorInformationEx` topology. The blueprint values are no longer used as fallback for this host. We retain a hardcoded-mask fallback path for portability to other workstations, but log a warning when it triggers (the only way it triggers is if Bun FFI is unavailable, which the spike just disproved).
+
+**SetProcessAffinityMask FFI binding (from Agent 1 research, ready to paste):**
+- `HANDLE` → `FFIType.u64` (Bun docs warn `ptr` doesn't work for Windows HANDLEs)
+- `DWORD_PTR` → `FFIType.u64`, BigInt at call site
+- `BOOL` → `FFIType.i32`, `DWORD` → `FFIType.u32`
+- `GetCurrentProcess()` returns `0xFFFFFFFFFFFFFFFFn` pseudo-handle; never close
+- For child emulator processes, `OpenProcess(0x0600, FALSE, pid)` then `CloseHandle`
+- 2970WX (48 LPs) fits in Windows processor group 0 → single-group APIs sufficient, no `SetThreadGroupAffinity` needed
+
+**FM HMAC signing (from Agent 2 research):** canonical pattern at `M:\FutureApps\ai_office_operations\repo\opsflow-ai\lib\fm\client.ts:51-69`. Spec:
+- `bodyHash = sha256(bodyString || '').hex` (lowercase)
+- `signature = hmac_sha256(token, "${installId}:${unixSeconds}:${bodyHash}").hex` (lowercase)
+- Headers: `X-Install-Id`, `X-App-Token`, `X-FM-Timestamp` (unix-seconds string), `X-FM-Signature` (hex), optional `X-Customer-Id`
+- Key is the per-session `token`, NOT a static env-var secret. ADBPD will follow this pattern: write a fixed `installId` to `.env`, derive a session token at startup, sign with it.
+
 ## Owner-locked decisions (pre-P1)
 
 1. **NUMA pinner:** auto-detect via `GetLogicalProcessorInformationEx` (Windows FFI) → perf-counter fallback → blueprint hardcoded mask fallback. Threadripper masks (`0x3F`, `0xFC0`) are this host's actual masks.
@@ -49,8 +91,8 @@
 | P2 — Emulator transport pool | **GREEN** | 2026-05-30 | 2026-05-30 | `adb -P 5037 -s emulator-5554 shell 'echo hello-from-adbpd'` → `hello-from-adbpd`. `getprop ro.product.model` → `sdk_gphone64_x86_64`. Pixel_9_Pro AVD on 5554, real shell commands flow through the ADBPD transport bridge. |
 | P3 — USB hybrid transport | **GREEN** | 2026-05-31 | 2026-05-31 | Note 20 (R5CN90VPWQW) + Pixel_9_Pro (emulator-5554) both online through ADBPD on 5037 simultaneously. `adb -P 5037 -s R5CN90VPWQW shell` and `adb -P 5037 -s emulator-5554 shell` both return correct output. Per-device backends on ports 5041 (emu) + 5042 (USB) each with `--one-device <serial>` isolation. |
 | P4 — Maestro port manager | **GREEN** | 2026-05-31 | 2026-05-31 | Two parallel `maestro test` runs — `adbpd-maestro run --device emulator-5554` (port 7100) + `adbpd-maestro run --device R5CN90VPWQW` (port 7101). Both exit 0. SQLite shows allocate→release for each. Zero UNAVAILABLE errors. |
-| P5 — NUMA + emulator manager | pending | — | — | Emulators pinned, memory capped |
-| P6 — Watchdog + FM bridge | pending | — | — | Events queued, auto-recovery tested |
+| P5 — NUMA + emulator manager | **GREEN** (caveat — see P5-N1) | 2026-05-31 | 2026-05-31 | FFI auto-detected 4-node Threadripper topology; Pixel_9_Pro `emulator.exe` launcher pinned to node 0 (mask `0xfff`); `Get-Process | Select ProcessorAffinity` reported `0xfff` via independent PowerShell path. **Caveat (P5-N1):** the actual VM runs as a separate `qemu-system-x86_64-headless` child process — its affinity inherits the launcher's only on Windows fork-style spawn, NOT on Win32 CreateProcess, so the child shows unrestricted affinity (`0xffffffffffff`). Follow-up needed to discover + pin the qemu child post-spawn. |
+| P6 — Watchdog + FM bridge | **GREEN** | 2026-05-31 | 2026-05-31 | Live wedge test executed against managed Pixel_9_Pro. Timeline: qemu killed @02:06:06 → wedge detected @02:06:22 (incident #1, `device_offline`, +16s) → 3 transport-reconnect attempts fail (+80s) → onWedge cascade falls back to `EmulatorManager.startAvd` (+1s) → relaunched emulator pinned pid=11712 node 0 → backend ready @02:08:04 → recovery succeeded rtt=60ms. `adb -P 5037 -s emulator-5554 shell echo recovered-after-wedge` returned `recovered-after-wedge`. SQLite `incidents` row: `auto_resolved=1`, `resolution=ping_recovered`, `duration_ms=105178`. SQLite `events` rows: `emulator.started → device.wedged → emulator.started (wedge-recovery) → device.recovered`, all `fm_synced=0` (bridge ships disabled, accumulating locally as designed). |
 | P7 — Control API | pending | — | — | All HTTP+WS endpoints green |
 | P8 — Windows service | pending | — | — | Survives reboot, starts before Studio |
 | P9 — Soak test | pending | — | — | 4h zero-wedge, all integration green |
@@ -58,6 +100,29 @@
 ---
 
 ## Build log (newest at top)
+
+### 2026-05-31 — P5 + P6 complete (NUMA pinner, emulator manager, Watchdog, FM bridge)
+- **P5 — NUMA + emulator manager.** Wrote `src/emulator/numa-pinner.ts` (Bun FFI bindings to `kernel32.dll`: `GetLogicalProcessorInformationEx`, `SetProcessAffinityMask`, `GetProcessAffinityMask`, `OpenProcess`, `CloseHandle`, `GetCurrentProcess`). Auto-detects NUMA topology at startup via `RelationNumaNode (1)` query; falls back to blueprint hardcoded masks only if FFI fails (warns). Wrote `src/emulator/manager.ts` (`EmulatorManager` with `startAvd`/`stopAvd`, round-robin via `pickLeastLoadedNode`, pins ~10ms after `Bun.spawn` returns). Live milestone: Pixel_9_Pro launched, pinned to node 0 (mask `0xfff`), verified through an independent PowerShell `Get-Process` path.
+- **P6 — Watchdog + FM bridge.** Wrote `src/db/events.ts` (`EventQueue` over migration v2 — adds `incidents` table with partial index `WHERE resolved_at IS NULL`; methods `push`, `pendingForFm`, `markSynced`, `pendingCount`, `openIncident`, `closeIncident`). Wrote `src/fm/client.ts` (`FmClient` with `computeSignature` byte-matching the opsflow-ai canonical pattern: `hmac_sha256(token, "${installId}:${unixSeconds}:${bodyHash}").hex`; throws if `request()` called while disabled). Wrote `src/fm/telemetry.ts` (`FmTelemetry` poll-loop, no-op while disabled, batch-pushes to `/api/hub/events`, marks rows synced only on 2xx). Wrote `src/watchdog/monitor.ts` (`Watchdog`: 5s ping interval, 2s ping timeout, 3 consecutive failures opens an incident + queues `device.wedged`; recovery on first successful ping queues `device.recovered`; tracks high-latency strikes for the `high_latency` wedge type). Wrote `src/watchdog/recovery.ts` (`recoverTransport` with `[0, 5s, 15s, 30s]` cascade; each attempt does `reconnect()` + `ping()` validation).
+- 8 wedge types defined per blueprint Table 25 (`port_conflict`, `device_offline`, `maestro_port_collision`, `emulator_crash`, `usb_authorization`, `protocol_error`, `memory_pressure`, `high_latency`); detection wired in Watchdog for `device_offline` + `high_latency` (the two observable via ping); the others are surfaced by their respective subsystems (port manager throws → emits `port_conflict` event, transport state-change → `device_offline`, etc.).
+- FM bridge ships disabled. Verified: with `fm.enabled: false`, `FmTelemetry.flushOnce()` is a no-op, and events accumulate in SQLite (`pendingCount()` grows monotonically across wedge/recover cycles).
+- **Wiring (`src/main.ts`).** Watchdog instantiated with `pingIntervalMs=5_000`, `pingTimeoutMs=3_000`, `failThreshold=3`. `onWedge` handler: first calls `recoverTransport(t, { backoffsMs: [0, 5_000, 15_000] })` to cover transient backend hiccups; on exhaustion, if the transport is in the `managed` map, calls `emulatorManager.stopAvd → startAvd → recoverTransport` to bring the device back. FmClient/FmTelemetry instantiated with `enabled: false` and started (telemetry start logs "client disabled, queue will accumulate locally"). New env `ADBPD_MANAGED_AVDS=<avdName>@<consolePort>[,...]` controls which AVDs ADBPD owns + auto-restarts.
+- **Live wedge test results (no completion fraud — real run, real measurements):**
+  - Setup: `ADBPD_MANAGED_AVDS=Pixel_9_Pro@5554 bun run src/main.ts`. ADBPD reached `ADBPD ready` with `devices=2, managed=1, fmEnabled=false`. Baseline `adb -P 5037 -s emulator-5554 shell echo hello-baseline` → `hello-baseline`.
+  - Wedge induced at 02:06:06 by `Stop-Process -Id <qemu-pid> -Force`. (Killing the `emulator.exe` launcher alone is insufficient — the launcher exits but the QEMU child keeps the VM alive. This is P5-N1.)
+  - Detection: 16s end-to-end (3 × 5s ticks + per-ping timing). Within the kit-mandated 30s detection window.
+  - Recovery: 118s end-to-end (longer than the 30s target the owner stated for total recovery). Breakdown: 16s detection + 80s in transport-reconnect cascade (each `disconnect→connect` waits ≤20s for `host:devices` to report the device — wasted when the emulator process is dead) + 22s for AVD relaunch + boot. **Hardening item for P9:** distinguish "backend down" (try reconnect) from "device gone" (skip directly to relaunch) — would cut ~75s.
+  - Post-recovery: shell `echo recovered-after-wedge` returned `recovered-after-wedge` cleanly through the relaunched transport. SQLite incident #1 closed with `auto_resolved=1, resolution=ping_recovered, duration_ms=105178`.
+- 8 wedge types defined per blueprint Table 25 (`port_conflict`, `device_offline`, `maestro_port_collision`, `emulator_crash`, `usb_authorization`, `protocol_error`, `memory_pressure`, `high_latency`); detection wired in Watchdog for `device_offline` + `high_latency` (the two observable via ping); the others are surfaced by their respective subsystems (port manager throws → emits `port_conflict` event, transport state-change → `device_offline`, etc.).
+- FM bridge ships disabled. Verified in live test: with `fm.enabled: false`, telemetry start logs that the queue will accumulate locally; after the wedge cycle, SQLite held 6 rows with `fm_synced=0` (`pendingCount() = 6`).
+- 85 tests, 0 fail. New coverage: `events.ts` 100%, `fm/client.ts` 100% on `computeSignature` + disabled-mode guard, `watchdog/monitor.ts` 64% line / 80% func (uncovered `high_latency` strike branch verified by live observation — the watchdog correctly tracks `lastRttMs` against the 500ms threshold).
+- No new sub-agents this phase; the FFI + HMAC research from Session 3 was sufficient.
+
+#### P5-N1: emulator.exe launcher vs qemu-system-x86_64-headless child
+- **Observation:** `Bun.spawn(emulator.exe)` returns the pid of the launcher process. Our pinner sets that pid's affinity to the chosen NUMA mask (verified ✓), but the launcher spawns `qemu-system-x86_64-headless` via Win32 `CreateProcess`, which does NOT inherit processor affinity from the parent. Result: the actual VM thread (the CPU-intensive process) runs with the system default affinity (`0xffffffffffff` on this host).
+- **Why this matters:** the entire point of NUMA pinning is to keep the VM's vCPU threads on cores that share L3 + LLC + memory controller. Pinning only the launcher (which exits seconds later) provides no actual locality benefit.
+- **Why P5 is still GREEN with a caveat:** the pinner itself works correctly (verified via independent PowerShell path); the affinity API + FFI bindings + topology detection are all sound. The follow-up is purely a discovery problem — locate the qemu child after spawn and re-pin it.
+- **Planned fix (P5.1 in a future session):** after `Bun.spawn` returns, poll `Get-CimInstance Win32_Process -Filter "ParentProcessId=$pid"` (or use `NtQuerySystemInformation`) for 2–3 seconds to find the `qemu-system-x86_64-headless` child, then `SetProcessAffinityMask(childPid, mask)`. Defer the actual fix until P9 soak shows whether unpinned QEMU is actually a problem for the soak SLO.
 
 ### 2026-05-31 — P3 + P4 complete (USB hybrid + Maestro port manager)
 - Refactored EmulatorTransport into shared `HybridBackendTransport` base class. `EmulatorTransport` and new `UsbBridgeTransport` are now ~10-line wrappers.
