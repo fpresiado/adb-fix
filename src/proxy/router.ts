@@ -123,10 +123,10 @@ export function formatDeviceList(pool: TransportPool, long: boolean): string {
   const lines: string[] = [];
   for (const entry of pool.list()) {
     if (long) {
-      // Short format extended with product/model. Real values fill in once
-      // transports report properties (P2+).
+      // Long format with transport_id (required by modern dadb-based clients
+      // including Maestro 2.5+).
       lines.push(
-        `${entry.serial}\t${entry.state}\tproduct:${entry.product ?? 'unknown'}\tmodel:${entry.model ?? 'unknown'}\tdevice:${entry.serial}`,
+        `${entry.serial}\t${entry.state}\tproduct:${entry.product ?? 'unknown'}\tmodel:${entry.model ?? 'unknown'}\tdevice:${entry.serial}\ttransport_id:${entry.transportId}`,
       );
     } else {
       lines.push(`${entry.serial}\t${entry.state}`);

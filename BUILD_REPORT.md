@@ -47,8 +47,8 @@
 |-------|--------|-------|-----|----------------|
 | P1 — Smart Socket Proxy | **GREEN** | 2026-05-30 | 2026-05-30 | `adb -P 5037 version` / `devices` / `host-features` / `kill-server` all green via ADBPD |
 | P2 — Emulator transport pool | **GREEN** | 2026-05-30 | 2026-05-30 | `adb -P 5037 -s emulator-5554 shell 'echo hello-from-adbpd'` → `hello-from-adbpd`. `getprop ro.product.model` → `sdk_gphone64_x86_64`. Pixel_9_Pro AVD on 5554, real shell commands flow through the ADBPD transport bridge. |
-| P3 — USB hybrid transport | pending | — | — | Physical phone + emulator simultaneously |
-| P4 — Maestro port manager | pending | — | — | Parallel Maestro runs, zero UNAVAILABLE |
+| P3 — USB hybrid transport | **GREEN** | 2026-05-31 | 2026-05-31 | Note 20 (R5CN90VPWQW) + Pixel_9_Pro (emulator-5554) both online through ADBPD on 5037 simultaneously. `adb -P 5037 -s R5CN90VPWQW shell` and `adb -P 5037 -s emulator-5554 shell` both return correct output. Per-device backends on ports 5041 (emu) + 5042 (USB) each with `--one-device <serial>` isolation. |
+| P4 — Maestro port manager | **GREEN** | 2026-05-31 | 2026-05-31 | Two parallel `maestro test` runs — `adbpd-maestro run --device emulator-5554` (port 7100) + `adbpd-maestro run --device R5CN90VPWQW` (port 7101). Both exit 0. SQLite shows allocate→release for each. Zero UNAVAILABLE errors. |
 | P5 — NUMA + emulator manager | pending | — | — | Emulators pinned, memory capped |
 | P6 — Watchdog + FM bridge | pending | — | — | Events queued, auto-recovery tested |
 | P7 — Control API | pending | — | — | All HTTP+WS endpoints green |
@@ -58,6 +58,17 @@
 ---
 
 ## Build log (newest at top)
+
+### 2026-05-31 — P3 + P4 complete (USB hybrid + Maestro port manager)
+- Refactored EmulatorTransport into shared `HybridBackendTransport` base class. `EmulatorTransport` and new `UsbBridgeTransport` are now ~10-line wrappers.
+- Wrote `src/usb/enumerator.ts` (transient enumeration server + `parseDevicesLong`), `src/transport/usb-bridge.ts`, `src/db/schema.ts` (bun:sqlite, partial unique index, migrations + `events` table reserved for P6).
+- Wrote `src/maestro/port-manager.ts` (allocate/release with SQLite persistence, partial unique index handles port reuse), `src/maestro/process-wrapper.ts` (programmatic), `src/maestro/cli.ts` (the user-facing `adbpd-maestro run` command).
+- Fixed `host:devices-l` to include `transport_id` field (router.ts + pool.ts) for modern dadb-based clients. *Maestro itself uses `host:devices` (short format) per the research agent's report — confirmed not the original blocker, but transport_id is correct hygiene.*
+- Hit + fixed P3-F1 (USB isolation requires clean adb state — architected around it), P3-F2 (Windows USB settle delay), P4-F1 (partial unique index), P4-F2 (PATH + try/finally cleanup). One Sonnet 4.6 sub-agent dispatched to research Maestro/dadb protocol surface in parallel with the live retry; report informed the transport_id addition and confirmed `host:devices` (short) is the actual query.
+- Live milestones:
+  - P3: `adb -P 5037 devices` shows BOTH `emulator-5554 online` and `R5CN90VPWQW online`; shell commands round-trip on each.
+  - P4: parallel `adbpd-maestro run` against both devices completes with exit 0, distinct host ports (7100 + 7101) shown in SQLite, both rows have `released_at` populated post-exit.
+- 65 tests, 0 fail. Coverage ≥85% on shipped modules.
 
 ### 2026-05-30 — P2 complete (Emulator transport + bridge)
 - Wrote `src/emulator/discover.ts` (port-scan 5555..5585), `src/utils/port-finder.ts`, `src/transport/emulator.ts` (EmulatorTransport with hybrid per-emulator stock-adb backend), `src/transport/pool.ts` (already in place from P1, now exercised).
@@ -80,6 +91,30 @@
 - First-run `bun install` failed on `better-sqlite3` postinstall — see deviation D1.
 
 ### Phase failures + fixes
+
+#### P4-F2: Maestro adb-server PATH + DB cleanup on spawn failure
+- **Symptom:** First parallel-Maestro attempt: `FATAL: Executable not found in $PATH: "maestro"` for the EMU job, and `error: device 'R5CN90VPWQW' not found` for the USB job. Allocation row left with `released_at: NULL` because the cleanup never reached.
+- **Root cause:** (a) `Bun.spawn` inherits a different PATH than the parent shell on Windows, so `maestro` (a `.bat` script) couldn't be found. (b) The CLI's release/cleanup code ran AFTER the spawn, so any throw skipped it.
+- **Fix:** (a) Use `process.env.ADBPD_MAESTRO_PATH ?? 'C:/Users/plusu/.maestro/bin/maestro.bat'`. (b) Wrap the spawn in try/catch/finally so the forward removal + DB `released_at` UPDATE always run.
+- **Validation:** Subsequent runs show both rows with `released_at` populated immediately after exit, including failed runs.
+
+#### P4-F1: dev SQLite UNIQUE constraint blocked port reuse after release
+- **Symptom:** "release frees the port for reuse" unit test failed with `SQLiteError: UNIQUE constraint failed: maestro_ports.host_port`.
+- **Root cause:** The schema's `host_port INTEGER NOT NULL UNIQUE` was a full-table UNIQUE, so even a released row blocked reallocation of the same port.
+- **Fix:** Replaced with a partial unique index: `CREATE UNIQUE INDEX idx_maestro_ports_active_unique ON maestro_ports (host_port) WHERE released_at IS NULL`. Only active rows enforce uniqueness; released rows are historical.
+- **Validation:** Test updated to assert both behaviors (UNIQUE for active, reuse OK after release). Passes.
+
+#### P3-F2: USB device reported as offline by per-device backend
+- **Symptom:** After the transient enumeration server killed, the per-device backend's `host:devices` reported the USB device as `offline` for ~30s before going online (or staying offline). Maestro and `adb shell` both fail.
+- **Root cause:** The Windows USB driver layer doesn't immediately release device ownership when one adb-server is killed. The next adb-server's `--one-device <serial>` attaches but the device is in a stale-claim state.
+- **Fix:** Added a 4-second `sleep` between the enumeration-server `kill-server` and the start of per-device backends. The 2.5s I tried first was insufficient on this host.
+- **Validation:** Note 20 (R5CN90VPWQW) reliably reports `online` from ADBPD's `adb -P 5037 devices` ≥10s after launch, and `adb shell` works. *Note: this is a platform constraint on Windows USB ownership transfer, not a Bun or design flaw — the proper abstraction is the settle delay, not fighting the OS.*
+
+#### P3-F1: ANDROID_ADB_SERVER_PORT + --one-device isolation only works from a clean adb state
+- **Symptom:** Pre-flight spike showed `ANDROID_ADB_SERVER_PORT=5050 adb --one-device R5CN90VPWQW start-server` returning success, but the isolated server saw no devices. Investigation: a stock adb server was already running on 5037 and had grabbed USB ownership.
+- **Root cause:** Windows USB lets only ONE process own a USB device at a time. A second adb-server can start on a different port but cannot grab USB if another server already owns it.
+- **Fix (architectural):** ADBPD never owns USB directly. It only listens on 5037. Per-device backends own USB. A transient enumeration server starts BRIEFLY (no `--one-device`, sees all USB), reports devices, then dies, then per-device backends start fresh.
+- **Validation:** Spike confirmed the clean-state path works. Live P3 milestone confirms ADBPD attaches both emulator + USB and both are usable.
 
 #### P2-F3: live `adb shell` hangs after `transport bridge established`
 - **Symptom:** After P2 code was wired, `adb -P 5037 -s emulator-5554 shell 'echo hello'` printed nothing and timed out. Each retry created a new "bridge established" log entry, so the upgrade was succeeding but no shell output reached the client.

@@ -14,7 +14,7 @@
 import * as net from 'node:net';
 import { getLogger } from '../utils/logger.ts';
 import type { DeviceTransport } from '../transport/base.ts';
-import { EmulatorTransport } from '../transport/emulator.ts';
+import { HybridBackendTransport } from '../transport/hybrid-backend.ts';
 import type { TransportPool } from '../transport/pool.ts';
 import { encodeOkayData, tryParseRequest } from './protocol.ts';
 import type { HostCommand } from './protocol.ts';
@@ -184,8 +184,8 @@ export class SmartSocketProxy {
       client.end();
       return;
     }
-    if (!(transport instanceof EmulatorTransport)) {
-      log.error({ serial, type: transport.type }, 'upgrade target type not supported in P2');
+    if (!(transport instanceof HybridBackendTransport)) {
+      log.error({ serial, type: transport.type }, 'upgrade target type not supported');
       client.end();
       return;
     }

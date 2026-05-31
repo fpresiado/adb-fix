@@ -14,6 +14,7 @@ export interface DeviceListEntry {
   type: TransportType;
   model?: string;
   product?: string;
+  transportId: number;
 }
 
 export class TransportPool {
@@ -57,11 +58,17 @@ export class TransportPool {
   }
 
   list(): DeviceListEntry[] {
-    return Array.from(this.transports.values()).map((t) => ({
-      serial: t.serial,
-      state: t.state,
-      type: t.type,
-    }));
+    const out: DeviceListEntry[] = [];
+    let idx = 1;
+    for (const t of this.transports.values()) {
+      out.push({
+        serial: t.serial,
+        state: t.state,
+        type: t.type,
+        transportId: idx++,
+      });
+    }
+    return out;
   }
 
   onChange(handler: () => void): () => void {
