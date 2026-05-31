@@ -15,9 +15,9 @@
   "dependencies": {
     "@yume-chan/adb": "2.6.0",
     "@yume-chan/adb-server-node-tcp": "2.5.2",
-    "hono": "^4.0.0",
+    "hono": "4.12.23",
     "pino": "^9.0.0",
-    "zod": "^3.0.0"
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

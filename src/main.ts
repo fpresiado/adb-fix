@@ -16,6 +16,8 @@ import { recoverTransport } from './watchdog/recovery.ts';
 import { FmClient } from './fm/client.ts';
 import { FmTelemetry } from './fm/telemetry.ts';
 import type { HybridBackendTransport } from './transport/hybrid-backend.ts';
+import { MaestroPortManager } from './maestro/port-manager.ts';
+import { ControlApi } from './api/server.ts';
 
 const log = getLogger('main');
 
@@ -24,6 +26,8 @@ const EMULATOR_BIN = process.env.ADBPD_EMULATOR_BIN ?? 'C:/Android/sdk/emulator/
 const DB_PATH = process.env.ADBPD_DB_PATH ?? 'M:/FutureApps/adb-proxy-daemon/adbpd.sqlite';
 const BACKEND_PORT_BASE = Number.parseInt(process.env.ADBPD_BACKEND_PORT_BASE ?? '5040', 10);
 const ENUM_PORT = Number.parseInt(process.env.ADBPD_ENUM_PORT ?? '5039', 10);
+const API_HTTP_PORT = Number.parseInt(process.env.ADBPD_API_HTTP_PORT ?? '3002', 10);
+const API_WS_PORT = Number.parseInt(process.env.ADBPD_API_WS_PORT ?? '3003', 10);
 // `ADBPD_MANAGED_AVDS=Pixel_9_Pro@5554,Pixel_8@5556` — comma-separated AVDs
 // that ADBPD will launch + manage. These get auto-relaunched on wedge.
 const MANAGED_AVDS = process.env.ADBPD_MANAGED_AVDS ?? '';
@@ -72,6 +76,9 @@ async function main(): Promise<void> {
   });
   const telemetry = new FmTelemetry({ events, client: fm });
 
+  const maestroPorts = new MaestroPortManager({ db, pool });
+  const STARTED_AT = Date.now();
+
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
@@ -80,6 +87,7 @@ async function main(): Promise<void> {
     try {
       watchdog.stop();
       telemetry.stop();
+      await api.stop();
       for (const t of pool.all()) {
         try {
           await t.disconnect();
@@ -213,45 +221,112 @@ async function main(): Promise<void> {
     pingTimeoutMs: 3_000,
     failThreshold: 3,
     onWedge: async (t, incidentId) => {
+      const m = managed.get(t.serial);
+
+      // Fast-path: if this is a managed AVD and the VM process is dead,
+      // skip the transport-reconnect cascade entirely — only an AVD
+      // relaunch can fix a dead-VM wedge. Cuts ~80s of wasted reconnect.
+      // Per blueprint §7.1: "If PID dead: emulator crashed → restart with same config."
+      if (m !== undefined && emulatorManager !== undefined && !emulatorManager.isVmAlive(m.avdName)) {
+        log.warn(
+          { serial: t.serial, avdName: m.avdName },
+          'fast-path: VM PID dead, skipping reconnect cascade — direct relaunch',
+        );
+        await relaunchManagedAvd(t, m, incidentId);
+        return;
+      }
+
+      // Slow-path (transient backend hiccup, USB ownership lost, etc.):
+      // try transport-level reconnect first.
       const r1 = await recoverTransport(t, { backoffsMs: [0, 5_000, 15_000] });
       if (r1.success) {
         log.info({ serial: t.serial, attempts: r1.attempts }, 'recovered via transport reconnect');
         return;
       }
-      const m = managed.get(t.serial);
       if (m === undefined || emulatorManager === undefined) {
-        log.error({ serial: t.serial, incidentId }, 'transport reconnect exhausted; not a managed AVD — leaving offline');
+        log.error(
+          { serial: t.serial, incidentId },
+          'transport reconnect exhausted; not a managed AVD — leaving offline',
+        );
         return;
       }
-      log.warn({ serial: t.serial, avdName: m.avdName }, 'transport reconnect exhausted; relaunching managed AVD');
-      try {
-        await emulatorManager.stopAvd(m.avdName, ADB_PATH);
-      } catch {
-        /* may already be dead */
-      }
-      try {
-        const state = await emulatorManager.startAvd(m);
-        events.push('emulator.started', t.serial, {
-          avdName: m.avdName,
-          pid: state.pid,
-          via: 'wedge-recovery',
-        });
-        const r2 = await recoverTransport(t, { backoffsMs: [0, 5_000, 10_000, 10_000] });
-        if (r2.success) {
-          log.info({ serial: t.serial, attempts: r2.attempts }, 'recovered via AVD relaunch');
-        } else {
-          log.error({ serial: t.serial, incidentId }, 'AVD relaunch did not restore transport');
-        }
-      } catch (err) {
-        log.error({ serial: t.serial, err }, 'AVD relaunch threw');
-      }
+      log.warn(
+        { serial: t.serial, avdName: m.avdName },
+        'transport reconnect exhausted; relaunching managed AVD',
+      );
+      await relaunchManagedAvd(t, m, incidentId);
     },
   });
+  async function relaunchManagedAvd(
+    t: import('./transport/base.ts').DeviceTransport,
+    m: ManagedAvd,
+    incidentId: number,
+  ): Promise<void> {
+    if (emulatorManager === undefined) return;
+    try {
+      await emulatorManager.stopAvd(m.avdName, ADB_PATH);
+    } catch {
+      /* already dead */
+    }
+    try {
+      const state = await emulatorManager.startAvd(m);
+      events.push('emulator.started', t.serial, {
+        avdName: m.avdName,
+        pid: state.pid,
+        via: 'wedge-recovery',
+      });
+      const r = await recoverTransport(t, { backoffsMs: [0, 5_000, 10_000, 10_000] });
+      if (r.success) {
+        log.info({ serial: t.serial, attempts: r.attempts }, 'recovered via AVD relaunch');
+      } else {
+        log.error({ serial: t.serial, incidentId }, 'AVD relaunch did not restore transport');
+      }
+    } catch (err) {
+      log.error({ serial: t.serial, err }, 'AVD relaunch threw');
+    }
+  }
+
   watchdog.start();
   telemetry.start();
 
+  // 4. Control API — HTTP 3002 + WebSocket 3003.
+  const api = new ControlApi({
+    pool,
+    events,
+    proxy,
+    fm,
+    emulatorManager,
+    maestroPorts,
+    managedRegistry: managed,
+    configView: () => ({
+      fmEnabled: fm.enabled,
+      fmUrl: fm.url,
+      installId: fm.installId,
+      pingIntervalMs: 5000,
+      pingTimeoutMs: 3000,
+      failThreshold: 3,
+    }),
+    setFmEnabled: (en) => {
+      fm.setEnabled(en);
+      if (en) telemetry.start();
+      else telemetry.stop();
+    },
+    restartProxy: async () => {
+      await proxy.stop();
+      await proxy.start();
+    },
+    startedAt: STARTED_AT,
+  });
+  await api.start(API_HTTP_PORT, API_WS_PORT);
+
   log.info(
-    { devices: pool.all().length, managed: managed.size, fmEnabled: fm.enabled },
+    {
+      devices: pool.all().length,
+      managed: managed.size,
+      fmEnabled: fm.enabled,
+      apiHttp: API_HTTP_PORT,
+      apiWs: API_WS_PORT,
+    },
     'ADBPD ready',
   );
 }

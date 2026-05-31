@@ -36,6 +36,7 @@ function loadLib(): ReturnType<typeof dlopen> {
     GetCurrentProcess: { args: [], returns: u64 },
     SetProcessAffinityMask: { args: [u64, u64], returns: i32 },
     GetProcessAffinityMask: { args: [u64, ptr, ptr], returns: i32 },
+    GetExitCodeProcess: { args: [u64, ptr], returns: i32 },
   });
   return lib;
 }
@@ -214,6 +215,131 @@ export function pinProcessToNode(pid: number, node: NumaNode): bigint {
   } finally {
     closeProcessHandle(handle);
   }
+}
+
+const STILL_ACTIVE = 259;
+
+/**
+ * Returns true if the given pid is currently alive (not exited).
+ * Uses OpenProcess + GetExitCodeProcess for an authoritative answer that
+ * works even when the caller doesn't own the process (handle open with
+ * PROCESS_QUERY_INFORMATION only).
+ */
+export function isPidAlive(pid: number): boolean {
+  const k = loadLib();
+  const handle = k.symbols.OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
+  if (handle === 0n) return false;
+  try {
+    const exitBuf = new Uint32Array(1);
+    const ok = k.symbols.GetExitCodeProcess(handle, exitBuf);
+    if (ok === 0) return false;
+    return exitBuf[0] === STILL_ACTIVE;
+  } finally {
+    k.symbols.CloseHandle(handle);
+  }
+}
+
+interface ChildProcessInfo {
+  pid: number;
+  name: string;
+}
+
+/**
+ * Enumerate direct children of `parentPid` via PowerShell Get-CimInstance.
+ * Returns an empty array if PowerShell is unavailable or the query fails.
+ *
+ * Used by `findEmulatorVmChild()` to locate `qemu-system-x86_64-headless`
+ * after `emulator.exe` spawns it. See BUILD_REPORT P5-N1.
+ */
+export async function listChildProcesses(parentPid: number): Promise<ChildProcessInfo[]> {
+  try {
+    const proc = Bun.spawn(
+      [
+        'powershell',
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Get-CimInstance Win32_Process -Filter "ParentProcessId=${parentPid}" | Select-Object ProcessId, Name | ConvertTo-Json -Compress`,
+      ],
+      { stdout: 'pipe', stderr: 'ignore' },
+    );
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    const trimmed = out.trim();
+    if (trimmed.length === 0) return [];
+    const parsed = JSON.parse(trimmed) as
+      | { ProcessId: number; Name: string }
+      | { ProcessId: number; Name: string }[];
+    const arr = Array.isArray(parsed) ? parsed : [parsed];
+    return arr.map((r) => ({ pid: r.ProcessId, name: r.Name }));
+  } catch (err) {
+    log.debug(
+      { parentPid, err: err instanceof Error ? err.message : String(err) },
+      'listChildProcesses failed',
+    );
+    return [];
+  }
+}
+
+/**
+ * Poll for the qemu VM child of an `emulator.exe` launcher process.
+ * Returns the qemu pid as soon as it appears, or undefined if it doesn't
+ * appear within `timeoutMs`.
+ *
+ * The launcher spawns qemu via Win32 CreateProcess, which does NOT inherit
+ * processor affinity from the parent (P5-N1). We must re-pin the child.
+ */
+export async function findEmulatorVmChild(
+  launcherPid: number,
+  timeoutMs = 10_000,
+): Promise<number | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const children = await listChildProcesses(launcherPid);
+    const vm = children.find((c) => c.name.toLowerCase().startsWith('qemu-system'));
+    if (vm !== undefined) return vm.pid;
+    await sleep(250);
+  }
+  return undefined;
+}
+
+/**
+ * Wrapper for the full "pin the VM child" flow used by EmulatorManager:
+ *   1. Wait for qemu child to appear under launcherPid.
+ *   2. Pin it to the same NUMA node mask.
+ *   3. Return { vmPid, verifiedMask } or undefined if no child appeared.
+ *
+ * Failure to pin the child is logged as a warning, not thrown — the AVD
+ * still works, just without locality benefit.
+ */
+export async function pinEmulatorVmChild(
+  launcherPid: number,
+  node: NumaNode,
+  timeoutMs = 10_000,
+): Promise<{ vmPid: number; verifiedMask: bigint } | undefined> {
+  const vmPid = await findEmulatorVmChild(launcherPid, timeoutMs);
+  if (vmPid === undefined) {
+    log.warn({ launcherPid, timeoutMs }, 'qemu VM child did not appear in time');
+    return undefined;
+  }
+  try {
+    const verifiedMask = pinProcessToNode(vmPid, node);
+    log.info(
+      { launcherPid, vmPid, node: node.nodeNumber, mask: '0x' + verifiedMask.toString(16) },
+      'qemu VM child pinned',
+    );
+    return { vmPid, verifiedMask };
+  } catch (err) {
+    log.warn(
+      { launcherPid, vmPid, err: err instanceof Error ? err.message : String(err) },
+      'qemu VM child pin failed',
+    );
+    return undefined;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 /**

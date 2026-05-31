@@ -58,10 +58,26 @@ export function computeSignature(
 }
 
 export class FmClient {
-  constructor(private readonly cfg: FmConfig) {}
+  private cfg: FmConfig;
+
+  constructor(cfg: FmConfig) {
+    this.cfg = cfg;
+  }
 
   get enabled(): boolean {
     return this.cfg.enabled;
+  }
+
+  get url(): string {
+    return this.cfg.url;
+  }
+
+  get installId(): string {
+    return this.cfg.installId;
+  }
+
+  setEnabled(enabled: boolean): void {
+    this.cfg = { ...this.cfg, enabled };
   }
 
   async request<T = unknown>(req: FmRequest): Promise<FmResponse<T>> {

@@ -11,7 +11,9 @@
 import { getLogger } from '../utils/logger.ts';
 import {
   detectNumaTopology,
+  isPidAlive,
   pickLeastLoadedNode,
+  pinEmulatorVmChild,
   pinProcessToNode,
   type NumaNode,
   type NumaTopology,
@@ -24,11 +26,15 @@ const DEFAULT_CORES = 4;
 
 export interface ManagedEmulator {
   avdName: string;
+  /** PID of the emulator.exe launcher (short-lived; spawns the VM child). */
   pid: number;
+  /** PID of the qemu-system-x86_64-headless VM child (the real CPU consumer). */
+  vmPid: number | undefined;
   consolePort: number;
   adbPort: number;
   numaNode: number;
   affinityMask: bigint;
+  vmAffinityMask: bigint | undefined;
   memoryMb: number;
   startedAt: number;
 }
@@ -70,21 +76,32 @@ export class EmulatorManager {
       stderr: 'ignore',
     });
     const pid = proc.pid;
-    // Pin immediately. Goal is <500ms from spawn.
+    // Pin the launcher immediately. Goal is <500ms from spawn.
     const affinityMask = pinProcessToNode(pid, node);
 
     const state: ManagedEmulator = {
       avdName: opts.avdName,
       pid,
+      vmPid: undefined,
       consolePort: opts.consolePort,
       adbPort: opts.consolePort + 1,
       numaNode: node.nodeNumber,
       affinityMask,
+      vmAffinityMask: undefined,
       memoryMb: opts.memoryMb ?? DEFAULT_MEMORY_MB,
       startedAt: Date.now(),
     };
     this.running.set(opts.avdName, state);
     this.assignments.set(node.nodeNumber, (this.assignments.get(node.nodeNumber) ?? 0) + 1);
+
+    // P5-N1: the launcher CreateProcess's a `qemu-system-x86_64-headless`
+    // child that does NOT inherit affinity on Windows. Discover + pin it.
+    void pinEmulatorVmChild(pid, node).then((vmInfo) => {
+      if (vmInfo !== undefined) {
+        state.vmPid = vmInfo.vmPid;
+        state.vmAffinityMask = vmInfo.verifiedMask;
+      }
+    });
 
     // Detach from the proc — we don't await exited here; the emulator runs
     // until externally killed. The caller hooks teardown through stopAvd().
@@ -93,6 +110,29 @@ export class EmulatorManager {
     });
 
     return state;
+  }
+
+  /** Look up state for a managed AVD by its serial (`emulator-<consolePort>`). */
+  getBySerial(serial: string): ManagedEmulator | undefined {
+    for (const m of this.running.values()) {
+      if (`emulator-${m.consolePort}` === serial) return m;
+    }
+    return undefined;
+  }
+
+  /**
+   * Recovery signal: returns true if the managed AVD's VM process is alive.
+   * False means the qemu child is gone — the only fix is a full relaunch
+   * (transport-level reconnect cannot resurrect a dead VM).
+   *
+   * Falls back to the launcher pid if vmPid was never discovered (e.g. very
+   * early failure or non-Windows host).
+   */
+  isVmAlive(avdName: string): boolean {
+    const m = this.running.get(avdName);
+    if (m === undefined) return false;
+    if (m.vmPid !== undefined) return isPidAlive(m.vmPid);
+    return isPidAlive(m.pid);
   }
 
   /** Stop an emulator gracefully via the emulator console, then untrack. */

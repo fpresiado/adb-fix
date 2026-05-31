@@ -7,9 +7,9 @@
       "dependencies": {
         "@yume-chan/adb": "2.6.0",
         "@yume-chan/adb-server-node-tcp": "2.5.2",
-        "hono": "^4.0.0",
+        "hono": "4.12.23",
         "pino": "^9.0.0",
-        "zod": "^3.0.0",
+        "zod": "4.4.3",
       },
       "devDependencies": {
         "@types/node": "^22.0.0",
@@ -69,6 +69,6 @@
 
     "undici-types": ["undici-types@6.21.0", "", {}, "sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ=="],
 
-    "zod": ["zod@3.25.76", "", {}, "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ=="],
+    "zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
   }
 }

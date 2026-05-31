@@ -3,7 +3,8 @@
 // All device-state changes, wedges, recoveries, etc. are enqueued here.
 // When FM.exe is enabled (config.fm.enabled), the bridge polls and
 // publishes; until then, rows just accumulate (fm_synced = 0) and can
-// be replayed when the flag flips.
+// be replayed when the flag flips. The WebSocket hub also subscribes
+// via onPush so live clients see events as they happen.
 
 import type { Database } from 'bun:sqlite';
 import { getLogger } from '../utils/logger.ts';
@@ -31,7 +32,25 @@ export interface QueuedEvent {
   createdAt: number;
 }
 
+export type EventListener = (
+  eventType: EventType,
+  serial: string | null,
+  payload: Record<string, unknown>,
+  id: number,
+) => void;
+
+interface RawRow {
+  id: number;
+  event_type: EventType;
+  serial: string | null;
+  payload: string;
+  fm_synced: number;
+  created_at: number;
+}
+
 export class EventQueue {
+  private readonly listeners = new Set<EventListener>();
+
   constructor(private readonly db: Database) {
     // Migration v2 (in events.ts to keep co-located): add incidents.
     db.exec(`
@@ -60,34 +79,49 @@ export class EventQueue {
       .get(eventType, serial, JSON.stringify(payload), Date.now());
     if (row === null) throw new Error('events insert failed');
     log.debug({ id: row.id, eventType, serial }, 'event queued');
+    for (const l of this.listeners) {
+      try {
+        l(eventType, serial, payload, row.id);
+      } catch (err) {
+        log.warn({ err }, 'event listener threw');
+      }
+    }
     return row.id;
+  }
+
+  onPush(listener: EventListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   pendingForFm(limit = 100): QueuedEvent[] {
     return this.db
-      .query<
-        {
-          id: number;
-          event_type: EventType;
-          serial: string | null;
-          payload: string;
-          fm_synced: number;
-          created_at: number;
-        },
-        [number]
-      >(
+      .query<RawRow, [number]>(
         `SELECT id, event_type, serial, payload, fm_synced, created_at
          FROM events WHERE fm_synced = 0 ORDER BY created_at ASC LIMIT ?`,
       )
       .all(limit)
-      .map((r) => ({
-        id: r.id,
-        eventType: r.event_type,
-        serial: r.serial,
-        payload: safeParse(r.payload),
-        fmSynced: r.fm_synced === 1,
-        createdAt: r.created_at,
-      }));
+      .map(rowToEvent);
+  }
+
+  /** Page through events for /api/events. Newest first. */
+  recent(limit = 100, sinceId?: number): QueuedEvent[] {
+    if (sinceId === undefined) {
+      return this.db
+        .query<RawRow, [number]>(
+          `SELECT id, event_type, serial, payload, fm_synced, created_at
+           FROM events ORDER BY id DESC LIMIT ?`,
+        )
+        .all(limit)
+        .map(rowToEvent);
+    }
+    return this.db
+      .query<RawRow, [number, number]>(
+        `SELECT id, event_type, serial, payload, fm_synced, created_at
+         FROM events WHERE id > ? ORDER BY id DESC LIMIT ?`,
+      )
+      .all(sinceId, limit)
+      .map(rowToEvent);
   }
 
   markSynced(ids: readonly number[]): void {
@@ -132,6 +166,61 @@ export class EventQueue {
       )
       .run(now, autoResolved ? 1 : 0, resolution ?? null, duration, id);
   }
+
+  listIncidents(opts: { activeOnly?: boolean; limit?: number } = {}): Array<{
+    id: number;
+    serial: string;
+    incidentType: string;
+    detail: string | null;
+    autoResolved: boolean;
+    resolution: string | null;
+    durationMs: number | null;
+    createdAt: number;
+    resolvedAt: number | null;
+  }> {
+    const where = opts.activeOnly === true ? 'WHERE resolved_at IS NULL' : '';
+    const limit = opts.limit ?? 100;
+    type R = {
+      id: number;
+      serial: string;
+      incident_type: string;
+      detail: string | null;
+      auto_resolved: number;
+      resolution: string | null;
+      duration_ms: number | null;
+      created_at: number;
+      resolved_at: number | null;
+    };
+    return this.db
+      .query<R, [number]>(
+        `SELECT id, serial, incident_type, detail, auto_resolved, resolution,
+                duration_ms, created_at, resolved_at
+         FROM incidents ${where} ORDER BY id DESC LIMIT ?`,
+      )
+      .all(limit)
+      .map((r) => ({
+        id: r.id,
+        serial: r.serial,
+        incidentType: r.incident_type,
+        detail: r.detail,
+        autoResolved: r.auto_resolved === 1,
+        resolution: r.resolution,
+        durationMs: r.duration_ms,
+        createdAt: r.created_at,
+        resolvedAt: r.resolved_at,
+      }));
+  }
+}
+
+function rowToEvent(r: RawRow): QueuedEvent {
+  return {
+    id: r.id,
+    eventType: r.event_type,
+    serial: r.serial,
+    payload: safeParse(r.payload),
+    fmSynced: r.fm_synced === 1,
+    createdAt: r.created_at,
+  };
 }
 
 function safeParse(s: string): Record<string, unknown> {
