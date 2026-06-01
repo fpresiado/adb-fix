@@ -1,0 +1,24 @@
+node_modules/
+dist/
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+logs/*.log
+logs/*.log.*
+.env
+.env.local
+bun.lockb
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
+
+# Runtime artifacts (never commit)
+adbpd.sqlite
+adbpd.sqlite-shm
+adbpd.sqlite-wal
+adbpd.log
+*.transcript.log
+
+# Owner-proprietary spec — do not publish
+.blueprint.txt
