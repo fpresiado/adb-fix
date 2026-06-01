@@ -156,6 +156,11 @@ async function main(): Promise<void> {
           adbPort: avd.consolePort + 1,
           adbBinaryPath: ADB_PATH,
           backendPort,
+          // Cold-boot a fresh AVD from a Windows service can take 60-90s.
+          // The default 20s was tuned for warm/USB and times out before
+          // `device` shows up, leaving managed.set() unreached — meaning
+          // the watchdog can't auto-relaunch on wedge.
+          readyTimeoutMs: 120_000,
         });
         await t.connect();
         pool.add(t);
@@ -183,7 +188,16 @@ async function main(): Promise<void> {
     try {
       await t.connect();
       pool.add(t);
-      events.push('device.online', t.serial, { via: 'discovery' });
+      // If this discovered emulator corresponds to a configured managed AVD
+      // (a managed-launch above timed out + the AVD finished booting), claim
+      // it for the managed registry so the watchdog can auto-relaunch on wedge.
+      const claim = managedAvds.find((a) => `emulator-${a.consolePort}` === em.serial);
+      if (claim !== undefined && !managed.has(em.serial)) {
+        managed.set(em.serial, claim);
+        events.push('device.online', t.serial, { via: 'managed-claim-via-discovery' });
+      } else {
+        events.push('device.online', t.serial, { via: 'discovery' });
+      }
     } catch (err) {
       log.error({ serial: em.serial, err }, 'failed to attach emulator');
     }

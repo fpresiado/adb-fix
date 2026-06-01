@@ -47,6 +47,12 @@ export interface HybridBackendOptions {
   /** Private port on which to run the dedicated backend adb server. */
   backendPort: number;
   /**
+   * Override how long `connect()` waits for the backend to report the
+   * device as `online`. Defaults to 20s — adequate for warm AVDs and USB
+   * but too short for a cold AVD boot from a Windows service (35-90s typical).
+   */
+  readyTimeoutMs?: number;
+  /**
    * Optional process spawner override (tests inject a stub). Defaults to
    * `Bun.spawn` of the adb binary.
    */
@@ -100,7 +106,8 @@ export class HybridBackendTransport implements DeviceTransport {
         this.emitError(asError(err));
       });
 
-    const deadline = Date.now() + READY_TOTAL_TIMEOUT_MS;
+    const readyTimeout = this.opts.readyTimeoutMs ?? READY_TOTAL_TIMEOUT_MS;
+    const deadline = Date.now() + readyTimeout;
     while (Date.now() < deadline) {
       try {
         await waitTcpReady(this.port, deadline);
@@ -117,7 +124,7 @@ export class HybridBackendTransport implements DeviceTransport {
     }
     this.setState('offline');
     throw new Error(
-      `HybridBackendTransport(${this.serial}): backend not ready within ${READY_TOTAL_TIMEOUT_MS}ms`,
+      `HybridBackendTransport(${this.serial}): backend not ready within ${readyTimeout}ms`,
     );
   }
 
