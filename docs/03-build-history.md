@@ -1,10 +1,10 @@
 # ADBPD — Build Report
 
 **Owner:** Francisco Ricardo Preciado Jr · Future @I LLC
-**Spec:** `Z:\FutureApps\universal_tools\tools\adb\ADBPD_Blueprint_v1.0.docx`
+**Spec:** owner-supplied architectural blueprint v1.0 (not included in this public repo)
 **Builder:** Claude Opus 4.7 (Claude Code CLI)
 **Build start:** 2026-05-30
-**Host:** `beastai` — AMD Ryzen Threadripper 2970WX, Windows 11, M:/ workspace
+**Host:** AMD Ryzen Threadripper 2970WX, Windows 11, M:/ workspace
 
 > Source of truth for every decision, deviation, failure, and fix during the
 > build. Updated at every phase boundary.
@@ -59,7 +59,7 @@ Die 1: 0xFC0  (cores 6-11)  ← wrong: those cores belong to node 0, not die 1
 - For child emulator processes, `OpenProcess(0x0600, FALSE, pid)` then `CloseHandle`
 - 2970WX (48 LPs) fits in Windows processor group 0 → single-group APIs sufficient, no `SetThreadGroupAffinity` needed
 
-**FM HMAC signing (from Agent 2 research):** canonical pattern at `M:\FutureApps\ai_office_operations\repo\opsflow-ai\lib\fm\client.ts:51-69`. Spec:
+**FM HMAC signing (from Agent 2 research):** canonical pattern at a canonical HMAC pattern in a separate internal project. Spec:
 - `bodyHash = sha256(bodyString || '').hex` (lowercase)
 - `signature = hmac_sha256(token, "${installId}:${unixSeconds}:${bodyHash}").hex` (lowercase)
 - Headers: `X-Install-Id`, `X-App-Token`, `X-FM-Timestamp` (unix-seconds string), `X-FM-Signature` (hex), optional `X-Customer-Id`
@@ -128,7 +128,7 @@ Die 1: 0xFC0  (cores 6-11)  ← wrong: those cores belong to node 0, not die 1
 
 
 - **P5 — NUMA + emulator manager.** Wrote `src/emulator/numa-pinner.ts` (Bun FFI bindings to `kernel32.dll`: `GetLogicalProcessorInformationEx`, `SetProcessAffinityMask`, `GetProcessAffinityMask`, `OpenProcess`, `CloseHandle`, `GetCurrentProcess`). Auto-detects NUMA topology at startup via `RelationNumaNode (1)` query; falls back to blueprint hardcoded masks only if FFI fails (warns). Wrote `src/emulator/manager.ts` (`EmulatorManager` with `startAvd`/`stopAvd`, round-robin via `pickLeastLoadedNode`, pins ~10ms after `Bun.spawn` returns). Live milestone: Pixel_9_Pro launched, pinned to node 0 (mask `0xfff`), verified through an independent PowerShell `Get-Process` path.
-- **P6 — Watchdog + FM bridge.** Wrote `src/db/events.ts` (`EventQueue` over migration v2 — adds `incidents` table with partial index `WHERE resolved_at IS NULL`; methods `push`, `pendingForFm`, `markSynced`, `pendingCount`, `openIncident`, `closeIncident`). Wrote `src/fm/client.ts` (`FmClient` with `computeSignature` byte-matching the opsflow-ai canonical pattern: `hmac_sha256(token, "${installId}:${unixSeconds}:${bodyHash}").hex`; throws if `request()` called while disabled). Wrote `src/fm/telemetry.ts` (`FmTelemetry` poll-loop, no-op while disabled, batch-pushes to `/api/hub/events`, marks rows synced only on 2xx). Wrote `src/watchdog/monitor.ts` (`Watchdog`: 5s ping interval, 2s ping timeout, 3 consecutive failures opens an incident + queues `device.wedged`; recovery on first successful ping queues `device.recovered`; tracks high-latency strikes for the `high_latency` wedge type). Wrote `src/watchdog/recovery.ts` (`recoverTransport` with `[0, 5s, 15s, 30s]` cascade; each attempt does `reconnect()` + `ping()` validation).
+- **P6 — Watchdog + FM bridge.** Wrote `src/db/events.ts` (`EventQueue` over migration v2 — adds `incidents` table with partial index `WHERE resolved_at IS NULL`; methods `push`, `pendingForFm`, `markSynced`, `pendingCount`, `openIncident`, `closeIncident`). Wrote `src/fm/client.ts` (`FmClient` with `computeSignature` byte-matching the canonical HMAC pattern: `hmac_sha256(token, "${installId}:${unixSeconds}:${bodyHash}").hex`; throws if `request()` called while disabled). Wrote `src/fm/telemetry.ts` (`FmTelemetry` poll-loop, no-op while disabled, batch-pushes to `/api/hub/events`, marks rows synced only on 2xx). Wrote `src/watchdog/monitor.ts` (`Watchdog`: 5s ping interval, 2s ping timeout, 3 consecutive failures opens an incident + queues `device.wedged`; recovery on first successful ping queues `device.recovered`; tracks high-latency strikes for the `high_latency` wedge type). Wrote `src/watchdog/recovery.ts` (`recoverTransport` with `[0, 5s, 15s, 30s]` cascade; each attempt does `reconnect()` + `ping()` validation).
 - 8 wedge types defined per blueprint Table 25 (`port_conflict`, `device_offline`, `maestro_port_collision`, `emulator_crash`, `usb_authorization`, `protocol_error`, `memory_pressure`, `high_latency`); detection wired in Watchdog for `device_offline` + `high_latency` (the two observable via ping); the others are surfaced by their respective subsystems (port manager throws → emits `port_conflict` event, transport state-change → `device_offline`, etc.).
 - FM bridge ships disabled. Verified: with `fm.enabled: false`, `FmTelemetry.flushOnce()` is a no-op, and events accumulate in SQLite (`pendingCount()` grows monotonically across wedge/recover cycles).
 - **Wiring (`src/main.ts`).** Watchdog instantiated with `pingIntervalMs=5_000`, `pingTimeoutMs=3_000`, `failThreshold=3`. `onWedge` handler: first calls `recoverTransport(t, { backoffsMs: [0, 5_000, 15_000] })` to cover transient backend hiccups; on exhaustion, if the transport is in the `managed` map, calls `emulatorManager.stopAvd → startAvd → recoverTransport` to bring the device back. FmClient/FmTelemetry instantiated with `enabled: false` and started (telemetry start logs "client disabled, queue will accumulate locally"). New env `ADBPD_MANAGED_AVDS=<avdName>@<consolePort>[,...]` controls which AVDs ADBPD owns + auto-restarts.

@@ -52,9 +52,9 @@ Data:    `data/adbpd.db`
 Logs:    `logs/`
 Scripts: `scripts/`
 
-## FM.exe Integration
-Base URL: `http://192.168.1.190:3001`
-Auth: HMAC-SHA256, key from env `FM_HMAC_SECRET`
+## Telemetry Integration (optional, off by default)
+Base URL: configured via `ADBPD_FM_URL` env (placeholder default `http://localhost:3001`)
+Auth: HMAC-SHA256, key from env `ADBPD_FM_TOKEN`
 Pattern: see `src/fm/client.ts`. Failures are non-fatal — queue to DB and retry.
 
 ## Port Assignments

@@ -1,8 +1,7 @@
 // ADBPD — FM.exe HMAC-signed HTTP client.
 //
-// Mirrors the canonical signing pattern from
-// `M:\FutureApps\ai_office_operations\repo\opsflow-ai\lib\fm\client.ts:51-69`
-// byte-for-byte:
+// Mirrors a canonical HMAC signing pattern from a separate internal
+// project, byte-for-byte:
 //
 //   bodyHash  = sha256(JSON.stringify(body) || '').hex  (lowercase)
 //   message   = `${installId}:${unixSeconds}:${bodyHash}`

@@ -12,3 +12,13 @@ bun.lockb
 *.tsbuildinfo
 .DS_Store
 Thumbs.db
+
+# Runtime artifacts (never commit)
+adbpd.sqlite
+adbpd.sqlite-shm
+adbpd.sqlite-wal
+adbpd.log
+*.transcript.log
+
+# Owner-proprietary spec — do not publish
+.blueprint.txt

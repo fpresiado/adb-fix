@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { computeSignature, FmClient } from '../../src/fm/client.ts';
 import { createHash, createHmac } from 'node:crypto';
 
-describe('computeSignature — opsflow-ai canonical pattern', () => {
+describe('computeSignature — canonical HMAC pattern', () => {
   test('matches a manual recomputation for an empty body', () => {
     const token = 'sekret';
     const installId = 'abc-123';
