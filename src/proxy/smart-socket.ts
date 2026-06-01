@@ -36,6 +36,15 @@ export class SmartSocketProxy {
   private server: net.Server | undefined;
   private readonly deps: SmartSocketDeps;
   private readonly trackSockets = new Set<net.Socket>();
+  /**
+   * All currently-live sockets — client AND backend sides of every
+   * transport bridge, plus host-protocol sockets that haven't ended yet.
+   * Used by stop() to force-close everything (analogue of Bun's stop(true)).
+   * Without this, server.close() returns immediately but bridge sockets
+   * linger in CLOSE_WAIT and the kernel keeps the 5037 listen socket
+   * "zombied" until the dead pid's last handle drops.
+   */
+  private readonly liveSockets = new Set<net.Socket>();
   private unsubscribePool: (() => void) | undefined;
 
   constructor(deps: SmartSocketDeps) {
@@ -66,15 +75,34 @@ export class SmartSocketProxy {
     this.server = server;
   }
 
+  /**
+   * Forceful stop. Closes the listener AND every live socket (track
+   * subscribers, bridge clients, bridge backends). Without the forced
+   * destroy, Windows leaves the listen socket in a ghost LISTENING state
+   * owned by the dead pid — the zombie that bites the next service start.
+   */
   async stop(): Promise<void> {
     this.unsubscribePool?.();
     this.unsubscribePool = undefined;
-    for (const s of this.trackSockets) s.destroy();
+    for (const s of this.liveSockets) {
+      try {
+        s.destroy();
+      } catch {
+        /* */
+      }
+    }
+    this.liveSockets.clear();
     this.trackSockets.clear();
     if (this.server === undefined) return;
     await new Promise<void>((resolve) => this.server?.close(() => resolve()));
     this.server = undefined;
     log.info('smart socket stopped');
+  }
+
+  /** Track a socket for forceful cleanup at stop(). */
+  private trackLive(s: net.Socket): void {
+    this.liveSockets.add(s);
+    s.once('close', () => this.liveSockets.delete(s));
   }
 
   private async reclaimPortIfBusy(): Promise<void> {
@@ -100,6 +128,7 @@ export class SmartSocketProxy {
   }
 
   private handleConnection(socket: net.Socket): void {
+    this.trackLive(socket);
     let buffer = Buffer.alloc(0);
     let consumed = false; // protocol-mode reads from `data` events
     log.debug({ remote: socket.remoteAddress }, 'client connected');
@@ -196,9 +225,10 @@ export class SmartSocketProxy {
         backend = await transport.openBackend();
       } catch (err) {
         log.error({ serial, err }, 'failed to open backend; ending client');
-        client.end();
+        client.destroy();
         return;
       }
+      this.trackLive(backend);
 
       // Replay the literal host:transport request to the backend so its OKAY
       // flows through the bridge to the client.
@@ -219,22 +249,33 @@ export class SmartSocketProxy {
       // Forward any client bytes that arrived before the bridge was set up.
       if (pending.length > 0) backend.write(pending);
 
-      const closeBoth = (): void => {
+      // Relay close propagation: when EITHER side closes for any reason
+      // (clean end, error, or hard close), force-destroy the other. Without
+      // this, a Maestro session dying mid-command leaves the paired backend
+      // socket in CLOSE_WAIT forever — until ADBPD restarts. We listen on
+      // 'close' (not just 'end') because half-closed sockets fire 'end'
+      // without 'close', and destroying on 'end' alone leaves the other
+      // side in FIN_WAIT-2.
+      let bridgeClosed = false;
+      const closeBoth = (origin: 'client' | 'backend', reason: string): void => {
+        if (bridgeClosed) return;
+        bridgeClosed = true;
+        log.debug({ serial, origin, reason }, 'bridge closing — propagating');
         try {
-          client.end();
+          client.destroy();
         } catch {
           /* */
         }
         try {
-          backend.end();
+          backend.destroy();
         } catch {
           /* */
         }
       };
-      client.once('end', closeBoth);
-      client.once('error', closeBoth);
-      backend.once('end', closeBoth);
-      backend.once('error', closeBoth);
+      client.once('close', () => closeBoth('client', 'close'));
+      client.once('error', (err) => closeBoth('client', `error: ${err.message}`));
+      backend.once('close', () => closeBoth('backend', 'close'));
+      backend.once('error', (err) => closeBoth('backend', `error: ${err.message}`));
 
       log.info({ serial }, 'transport bridge established');
     })();

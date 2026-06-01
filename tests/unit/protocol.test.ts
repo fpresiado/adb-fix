@@ -68,7 +68,15 @@ describe('protocol — parseHostCommand', () => {
   });
 
   test('host:track-devices', () => {
-    expect(parseHostCommand('host:track-devices')).toEqual({ kind: 'track-devices' });
+    expect(parseHostCommand('host:track-devices')).toEqual({ kind: 'track-devices', long: false });
+  });
+
+  test('host:track-devices-l (long-format variant from modern Studio)', () => {
+    expect(parseHostCommand('host:track-devices-l')).toEqual({ kind: 'track-devices', long: true });
+  });
+
+  test('host:track-devices-proto-binary', () => {
+    expect(parseHostCommand('host:track-devices-proto-binary')).toEqual({ kind: 'track-devices', long: true });
   });
 
   test('host:transport-any/usb/local', () => {

@@ -34,6 +34,8 @@ export interface MaestroPortManagerOptions {
   rangeStart?: number;
   rangeEnd?: number;
   devicePort?: number;
+  /** Minimum ms between port release and port reuse. Default 5_000. */
+  cooldownMs?: number;
 }
 
 export class MaestroPortManager {
@@ -43,12 +45,21 @@ export class MaestroPortManager {
   private readonly rangeEnd: number;
   private readonly devicePort: number;
 
+  /**
+   * Minimum interval between a port being released and being reusable.
+   * Prevents the OS TIME_WAIT + immediate reallocation race where Maestro
+   * believes it owns a stale TIME_WAIT-d connection from the previous
+   * session. 5s matches the default Maestro listener accept timeout.
+   */
+  private readonly cooldownMs: number;
+
   constructor(opts: MaestroPortManagerOptions) {
     this.db = opts.db;
     this.pool = opts.pool;
     this.rangeStart = opts.rangeStart ?? 7100;
     this.rangeEnd = opts.rangeEnd ?? 7200;
     this.devicePort = opts.devicePort ?? 7001;
+    this.cooldownMs = opts.cooldownMs ?? 5_000;
   }
 
   /**
@@ -169,19 +180,27 @@ export class MaestroPortManager {
   }
 
   private findFreePort(): number {
-    const used = new Set(
+    // A port is "unavailable" if it has an active (un-released) allocation,
+    // OR it was released within the last `cooldownMs` and we don't want
+    // to immediately reuse it (avoids TIME_WAIT races + stale Maestro
+    // listener-reuse). The result is round-robin rotation rather than
+    // instant reuse of the most-recently-released port.
+    const cooldownThreshold = Date.now() - this.cooldownMs;
+    const unavailable = new Set(
       this.db
-        .query<{ host_port: number }, []>(
-          'SELECT host_port FROM maestro_ports WHERE released_at IS NULL',
+        .query<{ host_port: number }, [number]>(
+          `SELECT DISTINCT host_port FROM maestro_ports
+           WHERE released_at IS NULL OR released_at > ?`,
         )
-        .all()
+        .all(cooldownThreshold)
         .map((r) => r.host_port),
     );
     for (let port = this.rangeStart; port <= this.rangeEnd; port++) {
-      if (!used.has(port)) return port;
+      if (!unavailable.has(port)) return port;
     }
     throw new Error(
-      `MaestroPortManager: no free port in [${this.rangeStart}, ${this.rangeEnd}]`,
+      `MaestroPortManager: no free port in [${this.rangeStart}, ${this.rangeEnd}] ` +
+        `(all in active use or within ${this.cooldownMs}ms cooldown)`,
     );
   }
 }

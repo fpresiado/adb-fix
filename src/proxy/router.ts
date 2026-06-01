@@ -72,7 +72,8 @@ export function handleHostCommand(
     case 'track-devices':
       // First snapshot; the smart-socket layer keeps the socket open and pushes
       // updates as the pool emits changes (wired in smart-socket.ts).
-      return { wire: encodeOkayData(formatDeviceList(deps.pool, false)) };
+      // Modern Studio sends track-devices-l (long-format) — cmd.long flag.
+      return { wire: encodeOkayData(formatDeviceList(deps.pool, cmd.long)) };
 
     case 'features':
     case 'host-features':

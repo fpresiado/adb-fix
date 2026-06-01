@@ -60,7 +60,7 @@ export type HostCommand =
   | { kind: 'version' }
   | { kind: 'kill' }
   | { kind: 'devices'; long: boolean }
-  | { kind: 'track-devices' }
+  | { kind: 'track-devices'; long: boolean }
   | { kind: 'transport'; selector: TransportSelector }
   | { kind: 'forward'; spec: string; norebind: boolean }
   | { kind: 'killforward'; local: string }
@@ -109,7 +109,11 @@ export function parseHostCommand(payload: string): HostCommand {
   if (cmd === 'kill') return { kind: 'kill' };
   if (cmd === 'devices') return { kind: 'devices', long: false };
   if (cmd === 'devices-l') return { kind: 'devices', long: true };
-  if (cmd === 'track-devices') return { kind: 'track-devices' };
+  if (cmd === 'track-devices') return { kind: 'track-devices', long: false };
+  if (cmd === 'track-devices-l') return { kind: 'track-devices', long: true };
+  // proto-binary track-devices format used by newer clients
+  if (cmd === 'track-devices-proto-binary') return { kind: 'track-devices', long: true };
+  if (cmd === 'track-devices-proto-text') return { kind: 'track-devices', long: true };
   if (cmd === 'features') return { kind: 'features' };
   if (cmd === 'host-features') return { kind: 'host-features' };
   if (cmd === 'list-forward') return { kind: 'list-forward' };
