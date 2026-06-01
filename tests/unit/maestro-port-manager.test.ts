@@ -56,7 +56,10 @@ beforeEach(() => {
   t2 = new FakeBackendTransport('R5CN90VPWQW');
   pool.add(t1);
   pool.add(t2);
-  manager = new MaestroPortManager({ db, pool, rangeStart: 7100, rangeEnd: 7102 });
+  // cooldownMs: 0 in tests — the cooldown's behavior is exercised by a
+  // dedicated test below; default-on would make every other assertion
+  // here racy.
+  manager = new MaestroPortManager({ db, pool, rangeStart: 7100, rangeEnd: 7102, cooldownMs: 0 });
 });
 
 afterEach(() => {
@@ -87,6 +90,21 @@ describe('MaestroPortManager', () => {
     expect(t1.removed).toContain('tcp:7100');
     const b = await manager.allocate('emulator-5554', 'f2.yaml');
     expect(b.hostPort).toBe(7100); // freed → reallocated
+  });
+
+  test('cooldown keeps a just-released port out of the pool', async () => {
+    const cooled = new MaestroPortManager({
+      db,
+      pool,
+      rangeStart: 7100,
+      rangeEnd: 7102,
+      cooldownMs: 60_000,
+    });
+    const a = await cooled.allocate('emulator-5554', 'f1.yaml');
+    await cooled.release(a.id);
+    // Port 7100 is in cooldown → next alloc should rotate to 7101.
+    const b = await cooled.allocate('emulator-5554', 'f2.yaml');
+    expect(b.hostPort).toBe(7101);
   });
 
   test('throws when range is exhausted', async () => {

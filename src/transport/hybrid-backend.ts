@@ -199,8 +199,39 @@ export class HybridBackendTransport implements DeviceTransport {
     return out;
   }
 
+  /**
+   * Remove a forward. Idempotent: if adb reports "listener not found"
+   * (because the device disconnected and adb already cleaned it up, or
+   * because this is a duplicate cleanup), treat as success.
+   *
+   * Other FAIL responses are still surfaced as errors.
+   */
   async removeForward(local: string): Promise<void> {
-    await this.sendHostCommand(`host-serial:${this.serial}:killforward:${local}`);
+    try {
+      await this.sendHostCommand(`host-serial:${this.serial}:killforward:${local}`);
+    } catch (err) {
+      if (isHarmlessForwardError(err)) {
+        log.debug({ serial: this.serial, local }, 'removeForward: already gone, ignoring');
+        return;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Remove all forwards owned by this serial. Same idempotent semantics
+   * as removeForward.
+   */
+  async removeAllForwards(): Promise<void> {
+    try {
+      await this.sendHostCommand(`host-serial:${this.serial}:killforward-all`);
+    } catch (err) {
+      if (isHarmlessForwardError(err)) {
+        log.debug({ serial: this.serial }, 'removeAllForwards: already gone, ignoring');
+        return;
+      }
+      throw err;
+    }
   }
 
   async ping(): Promise<number> {
@@ -317,6 +348,29 @@ export class HybridBackendTransport implements DeviceTransport {
 
 function asError(e: unknown): Error {
   return e instanceof Error ? e : new Error(String(e));
+}
+
+/**
+ * Recognize FAIL responses from adb that should NOT be treated as errors
+ * during forward teardown — they all mean "the forward isn't there anymore",
+ * which is exactly the post-condition we want.
+ *
+ * Patterns observed across adb versions:
+ *   "listener 'tcp:7100' not found"
+ *   "cannot remove listener: ..."
+ *   "device 'XXX' not found"     (device already disconnected)
+ *   "device offline"
+ *   "device not found"
+ *   "no devices/emulators found"
+ */
+export function isHarmlessForwardError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes('listener') && msg.includes('not found') ||
+    msg.includes('cannot remove listener') ||
+    msg.includes('device') && (msg.includes('not found') || msg.includes('offline')) ||
+    msg.includes('no devices/emulators')
+  );
 }
 
 function sleep(ms: number): Promise<void> {

@@ -18,6 +18,7 @@ import { FmTelemetry } from './fm/telemetry.ts';
 import type { HybridBackendTransport } from './transport/hybrid-backend.ts';
 import { MaestroPortManager } from './maestro/port-manager.ts';
 import { ControlApi } from './api/server.ts';
+import { DeviceCleaner } from './lifecycle/cleanup.ts';
 
 const log = getLogger('main');
 
@@ -77,7 +78,30 @@ async function main(): Promise<void> {
   const telemetry = new FmTelemetry({ events, client: fm });
 
   const maestroPorts = new MaestroPortManager({ db, pool });
+  const cleaner = new DeviceCleaner({ db, pool });
   const STARTED_AT = Date.now();
+
+  // Per-device cleanup sweep on transport state-change → offline/disconnected.
+  // The TransportPool fires onChange when any transport's state changes; we
+  // diff against the previous state snapshot to detect downward transitions.
+  const lastState = new Map<string, string>();
+  pool.onChange(() => {
+    for (const t of pool.all()) {
+      const prev = lastState.get(t.serial);
+      lastState.set(t.serial, t.state);
+      if (prev !== undefined && prev !== t.state) {
+        if (t.state === 'offline' || t.state === 'disconnected') {
+          log.info(
+            { serial: t.serial, prev, next: t.state },
+            'device disconnected — running cleanup sweep',
+          );
+          void cleaner.sweepDevice(t.serial).catch((err) => {
+            log.error({ serial: t.serial, err }, 'cleanup sweep failed');
+          });
+        }
+      }
+    }
+  });
 
   // These are constructed during boot; the shutdown handler may fire BEFORE
   // any of them exist (e.g. SIGTERM during early init), so each ref is
@@ -93,9 +117,22 @@ async function main(): Promise<void> {
     shuttingDown = true;
     log.info({ signal }, 'shutdown initiated');
     try {
+      // (1) Stop new work coming in.
       watchdog?.stop();
       telemetry.stop();
       if (api !== undefined) await api.stop();
+
+      // (2) Run a full cleanup sweep — kill outstanding Maestro PIDs, remove
+      //     forwards, release ports, verify kernel state. This MUST happen
+      //     before transport disconnect because removeForward needs the
+      //     transport's backend to still be reachable.
+      try {
+        await cleaner.sweepAll();
+      } catch (err) {
+        log.warn({ err }, 'sweepAll error during shutdown');
+      }
+
+      // (3) Disconnect every transport (closes the per-device backends).
       for (const t of pool.all()) {
         try {
           await t.disconnect();
@@ -103,6 +140,8 @@ async function main(): Promise<void> {
           log.warn({ serial: t.serial, err }, 'transport disconnect error');
         }
       }
+
+      // (4) Stop any AVDs we own.
       if (emulatorManager !== undefined) {
         for (const m of emulatorManager.list()) {
           try {
@@ -112,7 +151,12 @@ async function main(): Promise<void> {
           }
         }
       }
+
+      // (5) Force-close the 5037 listener AND every live bridge socket.
+      //     Without this, the listen socket lingers in the Windows kernel
+      //     and the next service start can't bind.
       if (proxy !== undefined) await proxy.stop();
+
       db.close();
     } catch (err) {
       log.error({ err }, 'error during shutdown');
@@ -126,8 +170,22 @@ async function main(): Promise<void> {
     onKill: () => void shutdown('host:kill'),
   });
 
+  // Process signal handlers. We register all three because:
+  //   - SIGINT: ctrl-C in a foreground shell.
+  //   - SIGTERM: NSSM, systemd-style supervisors, `taskkill /T /F`.
+  //   - SIGBREAK: ctrl-break + how NSSM signals "stop with grace" on Win.
+  // We do NOT rely on process.on('exit', ...) — Bun on Windows does not
+  // reliably fire it while a net.Server is attached, so cleanup would be
+  // skipped on supervisor-initiated stop.
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  try {
+    // SIGBREAK is Windows-only; throws on POSIX. Wrap so the script still
+    // runs on dev macOS/Linux without crashing here.
+    process.on('SIGBREAK' as NodeJS.Signals, () => void shutdown('SIGBREAK'));
+  } catch {
+    /* not Windows — fine */
+  }
 
   await proxy.start();
 
