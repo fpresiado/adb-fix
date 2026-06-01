@@ -55,12 +55,54 @@ export class SmartSocketProxy {
     if (this.server !== undefined) return;
     await this.reclaimPortIfBusy();
 
+    // EADDRINUSE retry loop. Windows + NSSM occasionally leaves a kernel
+    // zombie on 5037 (dead pid still listed as owner). The zombie usually
+    // clears within ~30s once NSSM's own handle drops. We retry up to 12 x
+    // 5s = 60s of patience before giving up — which is preferable to
+    // exiting and letting NSSM relaunch into the SAME zombie.
+    const MAX_RETRIES = 12;
+    const RETRY_WAIT_MS = 5_000;
+    let lastErr: Error | undefined;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        await this.tryListenOnce();
+        if (attempt > 1) {
+          log.info({ attempt }, 'smart socket listening after retry');
+        }
+        this.unsubscribePool = this.deps.pool.onChange(() => this.broadcastTrack());
+        return;
+      } catch (err) {
+        lastErr = err instanceof Error ? err : new Error(String(err));
+        if ((lastErr as NodeJS.ErrnoException).code !== 'EADDRINUSE') {
+          throw lastErr;
+        }
+        log.warn(
+          { attempt, max: MAX_RETRIES, waitMs: RETRY_WAIT_MS },
+          'EADDRINUSE — waiting for zombie listener to clear',
+        );
+        await new Promise((r) => setTimeout(r, RETRY_WAIT_MS));
+        // Try reclaim again — the ghost may have cleared and stock adb
+        // may have replaced it during the wait.
+        await this.reclaimPortIfBusy();
+      }
+    }
+    throw lastErr ?? new Error('smart socket: bind failed after retries');
+  }
+
+  private async tryListenOnce(): Promise<void> {
     const server = net.createServer((socket) => this.handleConnection(socket));
     server.on('error', (err) => log.error({ err }, 'server error'));
 
     await new Promise<void>((resolve, reject) => {
       const onError = (err: Error): void => {
         server.off('error', onError);
+        // Destroy any sockets that might have attached during the failed
+        // bind so we don't leak handles into the next retry.
+        try {
+          server.close();
+        } catch {
+          /* */
+        }
         reject(err);
       };
       server.once('error', onError);
@@ -70,8 +112,6 @@ export class SmartSocketProxy {
         resolve();
       });
     });
-
-    this.unsubscribePool = this.deps.pool.onChange(() => this.broadcastTrack());
     this.server = server;
   }
 
@@ -120,7 +160,24 @@ export class SmartSocketProxy {
     const adb = process.env.ADBPD_ADB_PATH ?? 'adb';
     try {
       const child = Bun.spawn([adb, 'kill-server'], { stdout: 'ignore', stderr: 'ignore' });
-      await child.exited;
+      // Hard timeout — if the listener is a zombie, `adb kill-server` will
+      // connect (kernel accepts) but never get a response (no real adb is
+      // attached to drain the bytes), so child.exited never resolves.
+      // Kill the child after 3s and move on; the EADDRINUSE retry loop in
+      // start() will keep trying until the zombie clears.
+      const TIMEOUT_MS = 3_000;
+      const timer = setTimeout(() => {
+        try {
+          child.kill();
+        } catch {
+          /* */
+        }
+      }, TIMEOUT_MS);
+      try {
+        await child.exited;
+      } finally {
+        clearTimeout(timer);
+      }
     } catch (err) {
       log.error({ err }, 'failed to spawn adb kill-server');
     }
