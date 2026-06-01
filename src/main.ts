@@ -79,15 +79,23 @@ async function main(): Promise<void> {
   const maestroPorts = new MaestroPortManager({ db, pool });
   const STARTED_AT = Date.now();
 
+  // These are constructed during boot; the shutdown handler may fire BEFORE
+  // any of them exist (e.g. SIGTERM during early init), so each ref is
+  // nullable and the handler guards on undefined. Without this, an early
+  // signal triggers a TDZ ReferenceError that NSSM then crash-loops on.
+  let proxy: SmartSocketProxy | undefined;
+  let watchdog: Watchdog | undefined;
+  let api: ControlApi | undefined;
+
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     log.info({ signal }, 'shutdown initiated');
     try {
-      watchdog.stop();
+      watchdog?.stop();
       telemetry.stop();
-      await api.stop();
+      if (api !== undefined) await api.stop();
       for (const t of pool.all()) {
         try {
           await t.disconnect();
@@ -104,7 +112,7 @@ async function main(): Promise<void> {
           }
         }
       }
-      await proxy.stop();
+      if (proxy !== undefined) await proxy.stop();
       db.close();
     } catch (err) {
       log.error({ err }, 'error during shutdown');
@@ -113,7 +121,7 @@ async function main(): Promise<void> {
     process.exit(0);
   };
 
-  const proxy = new SmartSocketProxy({
+  proxy = new SmartSocketProxy({
     pool,
     onKill: () => void shutdown('host:kill'),
   });
@@ -214,7 +222,7 @@ async function main(): Promise<void> {
   // 3. Watchdog: pings every device every 5s; opens incident on 3 consecutive
   //    failures; recovery cascade fires; for managed AVDs, relaunches if
   //    transport-level reconnect can't restore.
-  const watchdog = new Watchdog({
+  watchdog = new Watchdog({
     pool,
     events,
     pingIntervalMs: 5_000,
@@ -290,7 +298,7 @@ async function main(): Promise<void> {
   telemetry.start();
 
   // 4. Control API — HTTP 3002 + WebSocket 3003.
-  const api = new ControlApi({
+  api = new ControlApi({
     pool,
     events,
     proxy,

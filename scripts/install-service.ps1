@@ -140,7 +140,9 @@ Write-Section "Starting $ServiceName"
 Start-Sleep -Seconds 3
 
 $svc = Get-Service -Name $ServiceName
-Write-Host "[$($svc.Status)] $ServiceName" -ForegroundColor (if ($svc.Status -eq 'Running') {'Green'} else {'Yellow'})
+$svcColor = 'Yellow'
+if ($svc.Status -eq 'Running') { $svcColor = 'Green' }
+Write-Host "[$($svc.Status)] $ServiceName" -ForegroundColor $svcColor
 
 # 5. Smoke test.
 Write-Section "Smoke test"
@@ -154,17 +156,13 @@ try {
 }
 
 # 6. Reboot verification instructions.
-Write-Section "After your next reboot — verify the service starts BEFORE Studio:"
-Write-Host @"
-  1. Reboot Windows.
-  2. As soon as login screen appears (do NOT open Android Studio yet):
-       - Open PowerShell.
-       - Run:
-           Get-Service ADBPD                                       # should be Running
-           Invoke-RestMethod http://127.0.0.1:3002/health           # should return status=ok
-           adb -P 5037 devices                                     # should list devices
-  3. Only after all three pass, open Android Studio.
-  4. If anything fails, capture $LogDir\adbpd.stderr.log.
-
-  To uninstall:  powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
-"@ -ForegroundColor Cyan
+Write-Section "After your next reboot, verify the service starts BEFORE Studio"
+Write-Host "  1. Reboot Windows." -ForegroundColor Cyan
+Write-Host "  2. At login (do NOT open Android Studio yet), open PowerShell and run:" -ForegroundColor Cyan
+Write-Host "       Get-Service ADBPD                            # Status: Running" -ForegroundColor Cyan
+Write-Host "       Invoke-RestMethod http://127.0.0.1:3002/health  # status: ok" -ForegroundColor Cyan
+Write-Host "       adb -P 5037 devices                          # devices listed" -ForegroundColor Cyan
+Write-Host "  3. Only after all three pass, open Android Studio." -ForegroundColor Cyan
+Write-Host "  4. If anything fails, capture $LogDir\adbpd.stderr.log." -ForegroundColor Cyan
+Write-Host "" -ForegroundColor Cyan
+Write-Host "  To uninstall: powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1" -ForegroundColor Cyan
