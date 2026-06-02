@@ -101,6 +101,18 @@ Die 1: 0xFC0  (cores 6-11)  ← wrong: those cores belong to node 0, not die 1
 
 ## Build log (newest at top)
 
+### 2026-06-02 — Session 8: v1.0.1 — NSSM experiments + memory-sampling fix
+
+- **NSSM config experiments (all failed to fix the inheritance):**
+  - `AppNoConsole 1` alone: zombie pattern unchanged when bun is killed.
+  - Removing `AppStdout` + `AppStderr` redirection: zombie pattern unchanged.
+  - `AppDontSpawnConsole`: not actually a valid NSSM parameter (mis-attribution in earlier docs; NSSM source confirms only `AppNoConsole` exists in this space).
+  - **Conclusion:** the NSSM handle-inheritance limit cannot be cleared by config tweaks. v1.2 candidates documented in `docs/04-disaster-recovery.md`: FFI `SetHandleInformation` on the listen socket, or replace NSSM with a custom wrapper using `CreateProcess(bInheritHandles=FALSE)`.
+
+- **Soak memory-sampling bug fixed (`scripts/soak.ts`).** Old logic picked `Get-Process bun | Sort -Descending WorkingSet64 | First 1`, which during a soak picked the harness. New logic walks `Win32_Service Name='ADBPD'` → `Win32_Process ParentProcessId=<nssm>`, → first `bun.exe` child, then samples that PID specifically. Live verification: NSSM pid 3268 → daemon bun child pid 28232 → working set 207 MB (the actual daemon, not the 423 MB harness number from v1.0.0's reading). The 100 MB SLO is still violated, but with an honest number we can now reason about whether the SLO is the right target for a Bun + SQLite + Hono daemon, or whether memory growth indicates a real leak vs steady-state cost.
+
+- **NSSM `AppNoConsole=1` left set** — it didn't fix the inheritance but it's a benign change (suppresses console allocation for the service process). No reason to revert.
+
 ### 2026-06-02 — Session 7: 4h production soak + v1.0.0 tag
 
 - **4h production soak ran to completion.** Started 01:45:34 UTC, ended 05:45:44 UTC, 240.2 min duration, 1402 total operations at 5.8 ops/min.

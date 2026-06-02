@@ -220,6 +220,12 @@ async function sampleHealth(cfg: SoakConfig, db: Database | undefined): Promise<
     /* leave -1 */
   }
 
+  // Sample the daemon's memory specifically — NOT just the largest bun.
+  // Pre-v1.0.1 this picked `Get-Process bun | Sort -Desc WorkingSet64 | First 1`,
+  // which during a soak picked the harness (300+ MB) instead of the daemon.
+  // Now: look up ADBPD service's actual PID via Win32_Service and sample that.
+  // Fall back to the old behavior if the service can't be queried (e.g. when
+  // running soak in dev shell against a non-service daemon).
   let memMb: number | null = null;
   try {
     const proc = Bun.spawn(
@@ -228,7 +234,16 @@ async function sampleHealth(cfg: SoakConfig, db: Database | undefined): Promise<
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        "(Get-Process bun -ErrorAction SilentlyContinue | Sort-Object -Property WorkingSet64 -Descending | Select-Object -First 1).WorkingSet64",
+        // Win32_Service.ProcessId is the NSSM supervisor; its only bun child
+        // is the daemon. Walk the parent->child tree to find the daemon bun.
+        "$svc = (Get-CimInstance Win32_Service -Filter \"Name='ADBPD'\").ProcessId; " +
+          "if ($svc -and $svc -gt 0) { " +
+          "  $child = (Get-CimInstance Win32_Process -Filter \"ParentProcessId=$svc AND Name='bun.exe'\" | Select-Object -First 1).ProcessId; " +
+          "  if ($child) { (Get-Process -Id $child -ErrorAction SilentlyContinue).WorkingSet64 } " +
+          "  else { (Get-Process -Id $svc -ErrorAction SilentlyContinue).WorkingSet64 } " +
+          "} else { " +
+          "  (Get-Process bun -ErrorAction SilentlyContinue | Sort-Object -Property WorkingSet64 -Descending | Select-Object -First 1).WorkingSet64 " +
+          "}",
       ],
       { stdout: 'pipe', stderr: 'ignore' },
     );
