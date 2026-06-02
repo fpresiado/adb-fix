@@ -188,6 +188,7 @@ export class SmartSocketProxy {
     this.trackLive(socket);
     let buffer = Buffer.alloc(0);
     let consumed = false; // protocol-mode reads from `data` events
+    const connectedAt = Date.now();
     log.debug({ remote: socket.remoteAddress }, 'client connected');
 
     const consume = (): void => {
@@ -205,6 +206,38 @@ export class SmartSocketProxy {
 
         const cmd: HostCommand = parseHostCommand(parsed.payload);
         log.debug({ payload: parsed.payload, kind: cmd.kind }, 'host command');
+
+        // Loud forensic log when a host:kill arrives. Includes everything
+        // we can identify the client by from inside the socket without an
+        // async OS lookup: remote IPv4 + ephemeral port + connection age +
+        // any earlier requests this socket sent. Owner uses this to find
+        // which tool is hitting kill-server (Studio quit, gradle daemon,
+        // leftover script, etc.) so we can stop the trigger upstream.
+        // The async PID-to-process resolution fires in the background.
+        if (cmd.kind === 'kill') {
+          const ctx = {
+            remoteAddress: socket.remoteAddress,
+            remotePort: socket.remotePort,
+            localPort: socket.localPort,
+            connectionAgeMs: Date.now() - connectedAt,
+            payload: parsed.payload,
+            timestamp: new Date(Date.now()).toISOString(),
+          };
+          log.warn(ctx, 'HOST:KILL received — daemon shutdown imminent');
+          // Best-effort client PID + process-name resolution. Fires async
+          // so it does not delay the OKAY reply; logs separately when done.
+          void resolveCallerProcess(socket).then((info) => {
+            if (info !== undefined) {
+              log.warn(
+                { ...ctx, callerPid: info.pid, callerName: info.name, callerPath: info.path },
+                'HOST:KILL caller identified',
+              );
+            } else {
+              log.warn(ctx, 'HOST:KILL caller resolution: no match (caller may already have closed)');
+            }
+          });
+        }
+
         const reply: RouterReply = handleHostCommand(cmd, this.deps);
 
         // For transport upgrades, we DO NOT write the router's OKAY ourselves.
@@ -354,3 +387,50 @@ export class SmartSocketProxy {
   }
 }
 
+/**
+ * Best-effort caller-process resolution for forensic logging on host:kill.
+ *
+ * Identifies the client process that opened the connection to 5037 by
+ * looking up its local TCP endpoint (loopback address + ephemeral port)
+ * via PowerShell `Get-NetTCPConnection`, then resolving the OwningProcess
+ * via `Get-Process`. Returns undefined if anything fails — the caller is
+ * expected to log accordingly and not retry.
+ *
+ * Used only on host:kill so the operational cost is one PowerShell spawn
+ * per kill event, not per request. The caller may already have closed by
+ * the time this runs (kill clients are usually `adb kill-server` which
+ * disconnects immediately); that's expected and logged as a no-match.
+ */
+async function resolveCallerProcess(
+  socket: net.Socket,
+): Promise<{ pid: number; name: string; path: string | null } | undefined> {
+  // From ADBPD's perspective: socket.remotePort is the CLIENT's ephemeral
+  // port (the one that connects out to 5037). For Get-NetTCPConnection we
+  // query that ephemeral port as LocalPort (it's local to the client's
+  // process on the same machine) with RemotePort=5037.
+  const clientEphemeralPort = socket.remotePort;
+  if (clientEphemeralPort === undefined) return undefined;
+
+  try {
+    const proc = Bun.spawn(
+      [
+        'powershell',
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        // Get the OwningProcess of the connection FROM client TO ADBPD's 5037.
+        `$conn = Get-NetTCPConnection -LocalPort ${clientEphemeralPort} -RemotePort 5037 -RemoteAddress 127.0.0.1 -ErrorAction SilentlyContinue | Select-Object -First 1;` +
+          `if ($conn) { $p = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue;` +
+          ` if ($p) { ConvertTo-Json -Compress -Depth 2 @{ pid = $p.Id; name = $p.ProcessName; path = $p.Path } } }`,
+      ],
+      { stdout: 'pipe', stderr: 'ignore' },
+    );
+    const out = (await new Response(proc.stdout).text()).trim();
+    await proc.exited;
+    if (out.length === 0) return undefined;
+    const parsed = JSON.parse(out) as { pid: number; name: string; path: string | null };
+    return { pid: parsed.pid, name: parsed.name, path: parsed.path };
+  } catch {
+    return undefined;
+  }
+}
