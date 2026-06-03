@@ -120,17 +120,44 @@ function handleTransport(selector: TransportSelector, deps: RouterDeps): RouterR
   return { wire: encodeOkay(), upgradeTo: 'transport', serial: picked.serial };
 }
 
+/**
+ * Translate ADBPD's internal TransportState into the ADB wire-protocol
+ * state word. Stock adb writes "device" for a ready/online device on the
+ * wire — NOT "online". dadb (used by Maestro 2.5+, scrcpy, others) parses
+ * strictly: only "device" means usable. Before this translation Maestro
+ * could not see any of ADBPD's devices because every entry was reported
+ * as "online" which dadb treats as unknown.
+ *
+ * Reference: AOSP system/core/adb/transport.cpp ConnectionStateName().
+ */
+function wireState(state: string): string {
+  switch (state) {
+    case 'online':
+      return 'device';
+    case 'recovery':
+      return 'recovery';
+    case 'unauthorized':
+      return 'unauthorized';
+    case 'offline':
+    case 'disconnected':
+    default:
+      return 'offline';
+  }
+}
+
 export function formatDeviceList(pool: TransportPool, long: boolean): string {
   const lines: string[] = [];
   for (const entry of pool.list()) {
+    const ws = wireState(entry.state);
     if (long) {
       // Long format with transport_id (required by modern dadb-based clients
-      // including Maestro 2.5+).
+      // including Maestro 2.5+). Note the SPACES (not tabs) between fields
+      // after the state column — stock adb uses spaces here.
       lines.push(
-        `${entry.serial}\t${entry.state}\tproduct:${entry.product ?? 'unknown'}\tmodel:${entry.model ?? 'unknown'}\tdevice:${entry.serial}\ttransport_id:${entry.transportId}`,
+        `${entry.serial}\t${ws} product:${entry.product ?? 'unknown'} model:${entry.model ?? 'unknown'} device:${entry.serial} transport_id:${entry.transportId}`,
       );
     } else {
-      lines.push(`${entry.serial}\t${entry.state}`);
+      lines.push(`${entry.serial}\t${ws}`);
     }
   }
   return lines.length === 0 ? '' : lines.join('\n') + '\n';
