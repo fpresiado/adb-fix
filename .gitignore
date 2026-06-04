@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+.bun/
+*.log
+data/*.db
+data/*.db-wal
+data/*.db-shm
+.env
+.env.local
+~$*.docx
+*.tmp
