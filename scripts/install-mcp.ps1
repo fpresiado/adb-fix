@@ -1,4 +1,4 @@
-# install-mcp.ps1 — copy Bridge .mcp.json templates into target project roots.
+# install-mcp.ps1 -- copy Bridge .mcp.json templates into target project roots.
 # Idempotent: skips when destination already matches source byte-for-byte.
 # Backs up any existing non-matching .mcp.json to .mcp.json.bak before overwrite.
 
@@ -29,7 +29,12 @@ $Targets = @(
 
 function Get-FileHashOrNull([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    # Use .NET directly so this works in any PS host even if the
+    # Microsoft.PowerShell.Utility module did not autoload.
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return [System.BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '') }
+    finally { $sha.Dispose() }
 }
 
 $installed = 0
@@ -41,14 +46,14 @@ foreach ($t in $Targets) {
     Write-Host "[$($t.Name)] $($t.Dest)"
 
     if (-not (Test-Path -LiteralPath $t.Source -PathType Leaf)) {
-        Write-Warning "  source template missing: $($t.Source) — skipping"
+        Write-Warning "  source template missing: $($t.Source) -- skipping"
         $missing++
         continue
     }
 
     $destDir = Split-Path -Parent $t.Dest
     if (-not (Test-Path -LiteralPath $destDir -PathType Container)) {
-        Write-Warning "  target project dir not found: $destDir — skipping"
+        Write-Warning "  target project dir not found: $destDir -- skipping"
         $missing++
         continue
     }
@@ -57,7 +62,7 @@ foreach ($t in $Targets) {
     $dstHash = Get-FileHashOrNull $t.Dest
 
     if ($null -ne $dstHash -and $srcHash -eq $dstHash) {
-        Write-Host "  already up-to-date — skipping"
+        Write-Host "  already up-to-date -- skipping"
         $skipped++
         continue
     }
