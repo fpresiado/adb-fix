@@ -31,6 +31,10 @@ try {
         if ($null -ne $bun) { $bunPath = $bun.Source }
     }
     if ($null -eq $bunPath) {
+        $userBun = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
+        if (Test-Path $userBun) { $bunPath = $userBun }
+    }
+    if ($null -eq $bunPath) {
         exit 0
     }
 

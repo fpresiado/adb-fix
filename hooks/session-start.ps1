@@ -28,6 +28,12 @@ try {
         $bun = Get-Command bun -ErrorAction SilentlyContinue
         if ($null -ne $bun) { $bunPath = $bun.Source }
     }
+    # Fallback: standard bun install location under %USERPROFILE%\.bun\bin
+    # (Claude Code may spawn hooks with a stripped PATH).
+    if ($null -eq $bunPath) {
+        $userBun = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
+        if (Test-Path $userBun) { $bunPath = $userBun }
+    }
     if ($null -eq $bunPath) {
         exit 0
     }
