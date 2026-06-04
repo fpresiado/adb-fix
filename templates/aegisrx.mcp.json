@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "bridge": {
+      "command": "bun",
+      "args": [
+        "run",
+        "Z:\\FutureApps\\universal_tools\\tools\\Bridge\\src\\mcp\\bridge-mcp.ts"
+      ],
+      "env": {
+        "BRIDGE_AGENT_ID": "aegis_agent",
+        "BRIDGE_WS_URL": "ws://127.0.0.1:4700",
+        "BRIDGE_HTTP_URL": "http://127.0.0.1:4701"
+      }
+    }
+  }
+}

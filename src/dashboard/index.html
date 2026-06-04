@@ -1,0 +1,99 @@
+<!--
+  Bridge dashboard — Isko's supervisor view served at http://127.0.0.1:4701/dashboard.
+  Plain HTML + vanilla JS + CSS. Connects to the broker WS on :4700 as agent "isko".
+-->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bridge — Isko Supervisor</title>
+    <link rel="stylesheet" href="/dashboard/dashboard.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">BRIDGE</span>
+        <span class="brand-sub">Sovereign Multi-Agent Broker</span>
+      </div>
+      <div class="status-cluster">
+        <span class="floor-pill" id="floorPill">floor: free</span>
+        <span class="conn-pill" id="connPill">disconnected</span>
+        <button class="btn btn-ghost" id="tokenBtn" type="button">Set Token</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <!-- LEFT RAIL: agents -->
+      <aside class="rail rail-left">
+        <h2 class="rail-title">Agents</h2>
+        <ul class="agent-list" id="agentList">
+          <li class="agent-empty">(none registered)</li>
+        </ul>
+        <h2 class="rail-title">Threads</h2>
+        <ul class="thread-list" id="threadList">
+          <li class="agent-empty">(no threads yet)</li>
+        </ul>
+      </aside>
+
+      <!-- CENTER: stream grouped by thread -->
+      <section class="stream" id="stream">
+        <div class="stream-inner" id="streamInner"></div>
+        <button class="jump-latest" id="jumpLatest" hidden type="button">Jump to latest ↓</button>
+      </section>
+
+      <!-- RIGHT PANEL: inject composer + floor override -->
+      <aside class="rail rail-right">
+        <h2 class="rail-title">Inject Message</h2>
+        <form class="inject" id="injectForm" autocomplete="off">
+          <label class="field">
+            <span>Target</span>
+            <select id="injectTo">
+              <option value="all">all (broadcast)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Type</span>
+            <select id="injectType">
+              <option value="chat">chat</option>
+              <option value="question">question</option>
+              <option value="status">status</option>
+              <option value="error">error</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Body</span>
+            <textarea id="injectBody" rows="5" placeholder="Message body…" required></textarea>
+          </label>
+          <button class="btn btn-primary" type="submit" id="injectBtn">Inject (priority)</button>
+          <p class="inject-hint">
+            Sent as <code>isko</code> with <code>priority:true</code> — bypasses floor.
+          </p>
+        </form>
+
+        <h2 class="rail-title">Floor Control</h2>
+        <button class="btn btn-warn" id="forceFloorBtn" type="button">Force release floor</button>
+        <p class="inject-hint" id="forceFloorHint">
+          Calls <code>DELETE /api/floor</code>.
+        </p>
+      </aside>
+    </main>
+
+    <!-- token dialog (lightweight, no <dialog> reliance) -->
+    <div class="modal-backdrop" id="modal" hidden>
+      <div class="modal" role="dialog" aria-labelledby="modalTitle">
+        <h3 id="modalTitle">Isko Bearer Token</h3>
+        <p>Stored in <code>sessionStorage</code> only — cleared on tab close.</p>
+        <input type="password" id="tokenInput" placeholder="paste token…" />
+        <div class="modal-actions">
+          <button class="btn btn-ghost" type="button" id="tokenCancel">Cancel</button>
+          <button class="btn btn-primary" type="button" id="tokenSave">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast" hidden></div>
+
+    <script src="/dashboard/dashboard.js" defer></script>
+  </body>
+</html>
