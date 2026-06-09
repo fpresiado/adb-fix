@@ -97,9 +97,26 @@ export class HybridBackendTransport implements DeviceTransport {
     ]);
 
     this.backend.exited
-      .then((code) => {
+      .then(async (code) => {
         log.warn({ serial: this.serial, code }, 'backend adb exited');
-        if (this._state !== 'disconnected') this.setState('offline');
+        if (this._state === 'disconnected') return;
+        // adb start-server forks the real daemon then exits (code 0) — the
+        // daemon itself may still be alive on the backend port.  Probe before
+        // marking offline so a normal launcher-exit doesn't kill a live device.
+        if (code === 0) {
+          try {
+            const list = await this.sendHostCommand('host:devices');
+            if (list.split('\n').some(
+              (line) => line.startsWith(`${this.serial}\t`) && line.includes('device'),
+            )) {
+              log.info({ serial: this.serial }, 'backend launcher exited but daemon still alive');
+              return;
+            }
+          } catch {
+            // port unreachable — daemon gone, fall through to setState('offline')
+          }
+        }
+        this.setState('offline');
       })
       .catch((err: unknown) => {
         log.error({ serial: this.serial, err }, 'backend adb spawn error');
